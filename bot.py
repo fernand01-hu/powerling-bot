@@ -1030,6 +1030,18 @@ def wait_for_connection_and_optimize(
                     f"{tag} [!] {reason} on {old_ip}; "
                     f"switching to fresh proxy IP {new_ip}..."
                 )
+                try:
+                    driver.execute_script("""
+                        try {
+                            const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                            if (G && G.network && G.network.webSocket) {
+                                G.network.webSocket.close(1000, "Normal Closure");
+                            }
+                        } catch (e) {}
+                    """)
+                    time.sleep(0.5)
+                except Exception:
+                    pass
                 forwarder.set_upstream(new_proxy)
                 tag = f"[Bot-{instance_id} | {new_ip}]"
                 captcha_start = None
@@ -1083,6 +1095,18 @@ def rotate_bot_ip_if_due(
         f"{tag} [*] {int(elapsed)}s elapsed on {old_ip} (Proxy Data: {kb_used:.1f} KB); "
         f"rotating to {new_ip}..."
     )
+    try:
+        driver.execute_script("""
+            try {
+                const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                if (G && G.network && G.network.webSocket) {
+                    G.network.webSocket.close(1000, "Normal Closure");
+                }
+            } catch (e) {}
+        """)
+        time.sleep(0.5)
+    except Exception:
+        pass
 
     forwarder.set_upstream(new_proxy)
 
@@ -1216,6 +1240,18 @@ def spawn_now(
                 f"{tag} [!] Spawn attempt {attempt + 1} timed out on {old_ip}; "
                 f"switching to {new_ip} and reloading..."
             )
+            try:
+                driver.execute_script("""
+                    try {
+                        const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                        if (G && G.network && G.network.webSocket) {
+                            G.network.webSocket.close(1000, "Normal Closure");
+                        }
+                    } catch (e) {}
+                """)
+                time.sleep(0.5)
+            except Exception:
+                pass
             forwarder.set_upstream(new_proxy)
             tag = f"[Bot-{instance_id} | {new_ip}]"
         else:
@@ -1570,6 +1606,17 @@ def run_bot_instance(
 
     finally:
         print(f"{tag} [*] Closing browser and cleaning up isolated profile.")
+        try:
+            driver.execute_script("""
+                try {
+                    const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                    if (G && G.network && G.network.webSocket) {
+                        G.network.webSocket.close(1000, "Normal Closure");
+                    }
+                } catch (e) {}
+            """)
+        except Exception:
+            pass
         try:
             driver.quit()
         except Exception:
