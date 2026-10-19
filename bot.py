@@ -158,10 +158,12 @@ def ensure_http_cache_seed():
     os.makedirs(HTTP_CACHE_SEED_DIR, exist_ok=True)
 
     opts = Options()
-    opts.add_argument("--headless=new")
+    opts.add_argument("--window-size=640,460")
     opts.add_argument(f"--disk-cache-dir={HTTP_CACHE_SEED_DIR}")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    driver = webdriver.Chrome(options=opts)
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    driver = launch_chrome_without_stealing_focus(opts, minimize=True)
     try:
         driver.execute_cdp_cmd("Network.enable", {})
         driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": BLOCKED_URL_PATTERNS})
@@ -187,6 +189,7 @@ class LocalProxyForwarder:
         "powerline.io",
         "sdg.games",
         "challenges.cloudflare.com",
+        "cloudflare.com",
         "code.jquery.com",
     )
 
@@ -246,10 +249,12 @@ class LocalProxyForwarder:
     def _is_blocked_host(self, host, port):
         if not host:
             return True
-        # Allow raw IPv4 addresses ONLY on Powerline.io game WebSocket ports (8000-8999)
+        if host in ("localhost", "127.0.0.1"):
+            return False
+        # Allow raw IPv4 addresses on Powerline.io game WebSocket ports (8000-9999)
         parts = host.split(".")
         if len(parts) == 4 and all(p.isdigit() for p in parts):
-            return not (port is not None and 8000 <= port <= 8999)
+            return not (port is not None and 8000 <= port <= 9999)
         # Allow only Powerline.io, master server (sdg.games), Cloudflare Turnstile, and jQuery
         allowed = any(
             host == suffix or host.endswith("." + suffix)
@@ -361,6 +366,7 @@ class LocalProxyForwarder:
 
 
 FLAGGED_IPS_FILE = os.path.join(tempfile.gettempdir(), "powerline_flagged_ips.txt")
+DIRECT_IP_LOCK = threading.Lock()
 
 
 class ProxyPool:
@@ -535,7 +541,7 @@ def check_proxy_game_server(proxy_info, server_host, server_port, timeout=3.5):
         tls = ctx.wrap_socket(s, server_hostname=server_host)
         tls.settimeout(timeout)
         ws_req = (
-            f"GET / HTTP/1.1\r\n"
+            f"GET /_/db1fa2b8 HTTP/1.1\r\n"
             f"Host: {server_host}:{server_port}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
@@ -548,6 +554,8 @@ def check_proxy_game_server(proxy_info, server_host, server_port, timeout=3.5):
         tls.close()
         if "101" in resp:
             return proxy_info, True, "OK"
+        elif "400" in resp:
+            return proxy_info, False, "Game server rejected IP (HTTP 400 Bad Request)"
         else:
             reason = resp.split("\r\n")[0] if resp else "Empty response"
             return proxy_info, False, reason
@@ -639,7 +647,9 @@ def configure_stealth_and_bandwidth_saver(driver):
 def get_game_state(driver):
     """Read key state fields from the powerline.io global object (Ub)."""
     return driver.execute_script("""
-        const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+        const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+            || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+        const G = getG();
         if (!G) return null;
         const lp = (G.localPlayer && G.localPlayer.id === G.localPlayerID && !G.localPlayer.dead)
             ? G.localPlayer
@@ -647,7 +657,7 @@ def get_game_state(driver):
         const topGui = document.getElementById('topGui');
         const nickInput = document.getElementById('nick');
         const net = G.network || {};
-        const topGuiVisible = !!(nickInput && nickInput.offsetParent !== null) || !!(topGui && !topGui.hidden) || !!net.hasConnection;
+        const topGuiVisible = !!(topGui && topGui.style.display !== 'none') || !!(nickInput && nickInput.offsetParent !== null);
         const entryturn = document.getElementById('entryturn');
         const captchaVisible = !!(entryturn && !entryturn.hidden && (entryturn.children.length > 0 || (entryturn.innerHTML && entryturn.innerHTML.trim().length > 0)));
         const statsVisible = !!(document.getElementById('statsPanel') &&
@@ -952,7 +962,9 @@ def apply_low_graphics_and_max_zoom_in(driver, tag):
 
     info = driver.execute_script(
         """
-        const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+        const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+            || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+        const G = getG();
         if (!G) return null;
         if (G.highQuality && typeof window.toggleGraphics === 'function') {
             window.toggleGraphics();
@@ -1009,8 +1021,8 @@ def wait_for_connection_and_optimize(
     while time.time() < deadline:
         state = get_game_state(driver)
         if state:
-            if state["hasConnection"]:
-                print(f"{tag} [+] Connected to server! Ready to join.")
+            if state["hasConnection"] and state["receivedConfig"]:
+                print(f"{tag} [+] Connected to server and received config! Ready to join.")
                 break
             if state["captchaVisible"] and captcha_start is None:
                 captcha_start = time.time()
@@ -1019,7 +1031,7 @@ def wait_for_connection_and_optimize(
                 captcha_start = None
 
             captcha_stalled = captcha_start is not None and (time.time() - captcha_start >= 10.0)
-            handshake_stalled = (time.time() - attempt_start >= 12.0) and not state["hasConnection"]
+            handshake_stalled = (time.time() - attempt_start >= 12.0) and not (state["hasConnection"] and state["receivedConfig"])
             if forwarder and proxy_pool and (captcha_stalled or handshake_stalled):
                 old_ip = f"{forwarder.proxy_info['host']}:{forwarder.proxy_info['port']}"
                 proxy_pool.mark_flagged(forwarder.proxy_info)
@@ -1033,7 +1045,9 @@ def wait_for_connection_and_optimize(
                 try:
                     driver.execute_script("""
                         try {
-                            const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                            const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+                                || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+                            const G = getG();
                             if (G && G.network && G.network.webSocket) {
                                 G.network.webSocket.close(1000, "Normal Closure");
                             }
@@ -1098,7 +1112,9 @@ def rotate_bot_ip_if_due(
     try:
         driver.execute_script("""
             try {
-                const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+                    || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+                const G = getG();
                 if (G && G.network && G.network.webSocket) {
                     G.network.webSocket.close(1000, "Normal Closure");
                 }
@@ -1157,25 +1173,35 @@ def spawn_now(
     """
     Human-like spawn/respawn:
     - On first spawn: types nickname character-by-character, pauses briefly, presses Enter.
-    - On respawn: waits a brief human reaction delay (0.32-0.72s), then presses Enter.
-    - Avoids spamming `clickPlay` while `nicknameModerationStatus === 'awaiting'` and resets
-      `playClicks = 0` so Powerline.io never triggers video ad prerolls (`U7()`).
+    - On respawn: waits a brief human reaction delay (0.25-0.50s), dismisses death screen
+      via `#deathPlayAgain` if present, or calls `window.clickPlay(nick)`.
+    - Resets `nicknameModerationStatus` and `playClicks = 0` so retries are never blocked
+      and Powerline.io never triggers video ad prerolls (`U7()`).
     """
     for attempt in range(4):
+        # Ensure server config is ready before attempting spawn
+        config_deadline = time.time() + 6
+        while time.time() < config_deadline:
+            state = get_game_state(driver)
+            if state and state["hasConnection"] and state["receivedConfig"]:
+                break
+            time.sleep(0.1)
+
         if is_first_spawn and attempt == 0:
             human_mouse_wiggle(driver)
             human_type_nickname(driver, nick)
-            time.sleep(random.uniform(0.18, 0.40))
+            time.sleep(random.uniform(0.18, 0.35))
         else:
-            time.sleep(random.uniform(0.32, 0.72))
+            time.sleep(random.uniform(0.25, 0.50))
 
         driver.execute_script(
             """
             try {
                 const nickInput = document.getElementById("nick");
                 if (nickInput) nickInput.value = arguments[0];
-                const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
-                const mod = G && G.network ? G.network.nicknameModerationStatus : '';
+                const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+                    || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+                const G = getG();
                 if (G) {
                     G.playClicks = 0;
                     G.focus = true;
@@ -1183,8 +1209,14 @@ def spawn_now(
                         clearTimeout(G.disconnectTimer);
                         G.disconnectTimer = null;
                     }
+                    if (G.network) {
+                        G.network.nicknameModerationStatus = "";
+                    }
                 }
-                if (mod !== 'awaiting' && typeof window.clickPlay === 'function') {
+                const deathBtn = document.getElementById("deathPlayAgain");
+                if (deathBtn && deathBtn.offsetParent !== null) {
+                    deathBtn.click();
+                } else if (typeof window.clickPlay === 'function') {
                     window.clickPlay(arguments[0]);
                 }
             } catch (e) {}
@@ -1192,7 +1224,7 @@ def spawn_now(
             nick,
         )
 
-        spawn_deadline = time.time() + 20
+        spawn_deadline = time.time() + 15
         last_click = time.time()
         while time.time() < spawn_deadline:
             state = get_game_state(driver)
@@ -1202,14 +1234,18 @@ def spawn_now(
                     f"room=#{state['roomID']} pos=({state['x']}, {state['y']}) dir={state['direction']}"
                 )
                 return state
+            if state and not state["hasConnection"]:
+                print(f"{tag} [!] Lost connection to server during spawn wait.")
+                break
             if time.time() - last_click >= 1.5:
                 driver.execute_script(
                     """
                     try {
                         const nickInput = document.getElementById("nick");
                         if (nickInput) nickInput.value = arguments[0];
-                        const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
-                        const mod = G && G.network ? G.network.nicknameModerationStatus : '';
+                        const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+                            || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+                        const G = getG();
                         if (G) {
                             G.playClicks = 0;
                             G.focus = true;
@@ -1217,8 +1253,14 @@ def spawn_now(
                                 clearTimeout(G.disconnectTimer);
                                 G.disconnectTimer = null;
                             }
+                            if (G.network) {
+                                G.network.nicknameModerationStatus = "";
+                            }
                         }
-                        if (mod !== 'awaiting' && typeof window.clickPlay === 'function') {
+                        const deathBtn = document.getElementById("deathPlayAgain");
+                        if (deathBtn && deathBtn.offsetParent !== null) {
+                            deathBtn.click();
+                        } else if (typeof window.clickPlay === 'function') {
                             window.clickPlay(arguments[0]);
                         }
                     } catch (e) {}
@@ -1243,7 +1285,9 @@ def spawn_now(
             try:
                 driver.execute_script("""
                     try {
-                        const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                        const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+                            || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+                        const G = getG();
                         if (G && G.network && G.network.webSocket) {
                             G.network.webSocket.close(1000, "Normal Closure");
                         }
@@ -1254,21 +1298,25 @@ def spawn_now(
                 pass
             forwarder.set_upstream(new_proxy)
             tag = f"[Bot-{instance_id} | {new_ip}]"
+            reload_lock = proxy_pool.get_ip_lock(new_proxy)
         else:
             print(f"{tag} [!] Spawn attempt {attempt + 1} timed out; reloading page...")
+            reload_lock = DIRECT_IP_LOCK
 
-        navigate_using_cache(driver, target_url)
-        wait_for_connection_and_optimize(
-            driver,
-            tag,
-            server_arg=server_arg,
-            target_url=target_url,
-            minimize=minimize,
-            forwarder=forwarder,
-            proxy_pool=proxy_pool,
-            instance_id=instance_id,
-            num_instances=num_instances,
-        )
+        with reload_lock:
+            navigate_using_cache(driver, target_url)
+            wait_for_connection_and_optimize(
+                driver,
+                tag,
+                server_arg=server_arg,
+                target_url=target_url,
+                minimize=minimize,
+                forwarder=forwarder,
+                proxy_pool=proxy_pool,
+                instance_id=instance_id,
+                num_instances=num_instances,
+            )
+            time.sleep(random.uniform(0.6, 1.2))
 
     raise RuntimeError(f"{tag} Timed out waiting for snake to spawn.")
 
@@ -1402,22 +1450,13 @@ def run_bot_instance(
     if forwarder:
         options.add_argument(f"--proxy-server=http://127.0.0.1:{forwarder.local_port}")
 
-    if minimize:
-        options.add_argument("--headless=new")
-        mode_str = "headless-minimized"
-        print(
-            f"{tag} [*] Launching Chrome ({mode_str}, keys={key_style}, "
-            f"profile={os.path.basename(profile_dir)})..."
-        )
-        driver = webdriver.Chrome(options=options)
-    else:
-        options.add_argument(f"--window-position={col * 640},{row * 460}")
-        mode_str = "background-unfocused"
-        print(
-            f"{tag} [*] Launching Chrome ({mode_str}, keys={key_style}, "
-            f"profile={os.path.basename(profile_dir)})..."
-        )
-        driver = launch_chrome_without_stealing_focus(options, minimize=False)
+    options.add_argument(f"--window-position={col * 640},{row * 460}")
+    mode_str = "shaded-minimized" if minimize else "background-unfocused"
+    print(
+        f"{tag} [*] Launching Chrome ({mode_str}, keys={key_style}, "
+        f"profile={os.path.basename(profile_dir)})..."
+    )
+    driver = launch_chrome_without_stealing_focus(options, minimize=minimize)
 
     try:
         configure_stealth_and_bandwidth_saver(driver)
@@ -1430,7 +1469,7 @@ def run_bot_instance(
 
         # Serialize initial Turnstile handshake per proxy IP so multiple bots sharing an IP
         # do not hit Cloudflare Turnstile at the exact same millisecond
-        ip_lock = proxy_pool.get_ip_lock(proxy_info) if proxy_pool else threading.Lock()
+        ip_lock = proxy_pool.get_ip_lock(proxy_info) if proxy_pool else DIRECT_IP_LOCK
         with ip_lock:
             if proxy_pool and forwarder and proxy_pool.is_flagged(proxy_info):
                 proxy_info = proxy_pool.rotate_proxy(instance_id, num_instances)
@@ -1528,7 +1567,8 @@ def run_bot_instance(
 
                 state = get_game_state(driver)
                 if not state or not state["isInGame"]:
-                    print(f"{tag} [!] Died during circle! Respawning...")
+                    print(f"{tag} [!] Died during circle! Waiting for death animation...")
+                    time.sleep(random.uniform(1.6, 2.2))
                     state = spawn_now(
                         driver,
                         nick,
@@ -1563,7 +1603,8 @@ def run_bot_instance(
                 while time.time() < step_end:
                     check = get_game_state(driver)
                     if not check or not check["isInGame"]:
-                        print(f"{tag} [!] Died mid-step! Respawning...")
+                        print(f"{tag} [!] Died mid-step! Waiting for death animation...")
+                        time.sleep(random.uniform(1.6, 2.2))
                         state = spawn_now(
                             driver,
                             nick,
@@ -1596,6 +1637,7 @@ def run_bot_instance(
 
             if round_idx < loops:
                 print(f"{tag} [*] Preparing respawn for Round {round_idx + 1}...")
+                time.sleep(random.uniform(1.6, 2.2))
 
         total_kb = forwarder.get_kb_used() if forwarder else 0.0
         print(
@@ -1609,7 +1651,9 @@ def run_bot_instance(
         try:
             driver.execute_script("""
                 try {
-                    const G = window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global;
+                    const getG = () => (window.vm_0x12d41d_50e8a6 && window.vm_0x12d41d_50e8a6.Global)
+                        || Object.values(window).find(v => v && v.Global && v.Global.gameName === 'powerline.io')?.Global;
+                    const G = getG();
                     if (G && G.network && G.network.webSocket) {
                         G.network.webSocket.close(1000, "Normal Closure");
                     }
@@ -1642,6 +1686,7 @@ def run_multi_bots(
     circle_seconds=5.0,
     step_delay=0.35,
     keep_open=3.0,
+    allow_direct=False,
 ):
     proxies = load_proxies(proxy_file)
     if proxies:
@@ -1650,7 +1695,11 @@ def run_multi_bots(
             f"({bots_per_ip} bots per IP, rotating IP every ~{ip_rotate_seconds:g}s)."
         )
     else:
-        print(f"[!] No proxies loaded from '{proxy_file}'; running with direct connection.")
+        if not allow_direct:
+            print(f"[!] Error: No proxies loaded from '{proxy_file}'.")
+            print("[!] Refusing to use your direct IP without explicit --allow-direct flag.")
+            sys.exit(1)
+        print(f"[!] No proxies loaded from '{proxy_file}'; running with direct connection (--allow-direct).")
 
     target_url, resolved_srv = build_target_url(server_arg)
     if resolved_srv:
@@ -1665,8 +1714,9 @@ def run_multi_bots(
         srv_host, srv_port = resolve_game_server_endpoint(server_arg, resolved_srv)
         working_proxies = filter_working_proxies(proxies, srv_host, srv_port)
         if not working_proxies:
-            print("[!] None of the proxies can connect to the game server; falling back to direct connection.")
-            proxies = []
+            print("[!] Error: None of the proxies can connect to the game server (rejected by Cloudflare / server).")
+            print("[!] Halting execution immediately to protect your direct IP from being used or flagged.")
+            sys.exit(1)
         else:
             proxies = working_proxies
             needed_per_ip = (instances + len(proxies) - 1) // len(proxies)
@@ -1753,6 +1803,11 @@ if __name__ == "__main__":
     parser.add_argument("--duration", type=float, default=5.0, help="Seconds to move in a circle per round")
     parser.add_argument("--step", type=float, default=0.35, help="Seconds between 90-degree turns")
     parser.add_argument("--keep-open", type=float, default=3.0, help="Seconds to wait after final round")
+    parser.add_argument(
+        "--allow-direct",
+        action="store_true",
+        help="Explicitly permit using direct connection without proxies (DANGEROUS: exposes host IP to rate-limits)",
+    )
     args = parser.parse_args()
 
     if args.list_servers:
@@ -1771,4 +1826,5 @@ if __name__ == "__main__":
         circle_seconds=args.duration,
         step_delay=args.step,
         keep_open=args.keep_open,
+        allow_direct=args.allow_direct,
     )
