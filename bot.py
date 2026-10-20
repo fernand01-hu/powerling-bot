@@ -418,15 +418,18 @@ class HumanMouse:
 
 
 # ============================================================================
-# 4. EzSolver Cloudflare Turnstile Handler
+# 4. EzSolver Cloudflare Turnstile Solver (ismoiloffS/EzSolver Integration)
 # ============================================================================
 class EzSolverTurnstile:
     """
-    Implements the EzSolver strategy for Cloudflare Turnstile handling:
-    - Scans DOM for Turnstile widgets, closed Shadow DOMs, or iframe challenges.
-    - Uses PyClick Bézier curves to interact with interactive checkboxes.
-    - Employs client-side token capture (window._ezsolver_token).
-    - Dismisses European GDPR cookie consent banners (Google Funding Choices).
+    Implements the complete EzSolver architecture (github.com/ismoiloffS/EzSolver):
+    1. Pierces Cloudflare Turnstile's closed Shadow DOM via early attachShadow hooking.
+    2. Inspects both native shadow roots, standard DOM, and #entryturn for the challenge iframe.
+    3. Calculates precise checkbox coordinates (rect.x + 28, rect.y + rect.h / 2).
+    4. Glides naturally to the checkbox using PyClick Bézier curves with overshoot.
+    5. Dispatches authentic mouse down/up CDP events to solve the challenge.
+    6. Verifies token resolution via [name="cf-turnstile-response"] and window.turnstile.getResponse().
+    7. Handles retry buttons (#captchaTryAgainButton) and GDPR consent modals.
     """
 
     def __init__(self, driver, mouse: HumanMouse):
@@ -436,90 +439,174 @@ class EzSolverTurnstile:
     def handle_gdpr_consent(self) -> bool:
         """Dismiss GDPR cookie consent if present."""
         try:
-            return bool(self.driver.execute_script(
-                """
-                const consentBtn = document.querySelector('.fc-cta-consent')
-                    || document.querySelector('button[aria-label="Consent"]')
-                    || Array.from(document.querySelectorAll('button, p')).find(el => el.innerText && el.innerText.trim() === 'Consent');
-                if (consentBtn) {
-                    consentBtn.click();
-                    return true;
-                }
-                return false;
-                """
-            ))
+            return bool(
+                self.driver.execute_script(
+                    """
+                    const consentBtn = document.querySelector('.fc-cta-consent')
+                        || document.querySelector('button[aria-label="Consent"]')
+                        || Array.from(document.querySelectorAll('button, p')).find(el => el.innerText && el.innerText.trim() === 'Consent');
+                    if (consentBtn) {
+                        consentBtn.click();
+                        return true;
+                    }
+                    return false;
+                    """
+                )
+            )
         except Exception:
             return False
 
-    def check_and_solve_turnstile(self) -> bool:
+    def get_turnstile_status(self) -> dict:
         """
-        Detects if Turnstile challenge is active and solves/bypasses it.
-        Returns True if a challenge was handled or none was needed.
+        Inspect the page using EzSolver's shadow-piercing techniques to determine
+        if Cloudflare Turnstile is actively challenging the user.
         """
         self.handle_gdpr_consent()
-
         try:
-            info = self.driver.execute_script(
+            return self.driver.execute_script(
                 """
                 const entryturn = document.getElementById('entryturn');
-                const turnstileIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                const hasTurnstileObj = typeof window.turnstile !== 'undefined';
-                const hasFailed = !!(document.getElementById('captchaFailed') && !document.getElementById('captchaFailed').hidden);
+                let entryVisible = false;
+                let entryRect = null;
+                if (entryturn) {
+                    const s = window.getComputedStyle(entryturn);
+                    const r = entryturn.getBoundingClientRect();
+                    // Visible if display != 'none', visibility != 'hidden', and has real dimensions
+                    if (s.display !== 'none' && s.visibility !== 'hidden' && r.width > 40 && r.height > 20) {
+                        entryVisible = true;
+                        entryRect = { x: r.x, y: r.y, w: r.width, h: r.height };
+                    }
+                }
+
+                // 1. Search for Turnstile iframe in captured shadow roots (EzSolver technique)
+                let ifr = null;
+                if (window._tsShadowRoot) {
+                    ifr = window._tsShadowRoot.querySelector('iframe');
+                }
+                if (!ifr && Array.isArray(window._tsShadowRoots)) {
+                    for (const sr of window._tsShadowRoots) {
+                        const f = sr.querySelector('iframe');
+                        if (f) { ifr = f; break; }
+                    }
+                }
+                // 2. Search main document for Cloudflare challenges iframe
+                if (!ifr) {
+                    for (const f of document.querySelectorAll('iframe')) {
+                        const src = f.src || f.getAttribute('src') || '';
+                        if (src.includes('challenges.cloudflare.com')) { ifr = f; break; }
+                    }
+                }
+                // 3. Search inside entryturn
+                if (!ifr && entryturn) {
+                    ifr = entryturn.querySelector('iframe');
+                }
+
+                let iframeRect = null;
+                if (ifr) {
+                    const r = ifr.getBoundingClientRect();
+                    if (r.width > 40 && r.height > 20) {
+                        iframeRect = { x: r.x, y: r.y, w: r.width, h: r.height };
+                    }
+                }
+
+                // Check for verified token
+                let token = null;
+                const inp = document.querySelector('[name="cf-turnstile-response"]');
+                if (inp && inp.value && inp.value.length > 20) {
+                    token = inp.value;
+                }
+                if (!token && typeof window.turnstile !== 'undefined' && typeof window.turnstile.getResponse === 'function') {
+                    try {
+                        const t = window.turnstile.getResponse();
+                        if (t && t.length > 20) token = t;
+                    } catch(e) {}
+                }
+
+                const captchaFailedEl = document.getElementById('captchaFailed');
+                const hasFailed = !!(captchaFailedEl && window.getComputedStyle(captchaFailedEl).display !== 'none');
+
                 return {
-                    entryturnVisible: !!(entryturn && !entryturn.hidden),
-                    hasIframe: !!turnstileIframe,
-                    hasTurnstileObj: hasTurnstileObj,
+                    isActive: (entryVisible || !!iframeRect) && !token,
+                    isSolved: !!token,
+                    token: token,
+                    iframeRect: iframeRect,
+                    entryRect: entryRect,
                     hasFailed: hasFailed
                 };
                 """
-            )
+            ) or {}
         except Exception:
-            return True
+            return {"isActive": False, "isSolved": False}
 
-        if not info:
-            return True
+    def is_turnstile_active(self) -> bool:
+        status = self.get_turnstile_status()
+        return bool(status.get("isActive")) or bool(status.get("hasFailed"))
 
-        # If interactive iframe checkbox exists, locate and click with PyClick
-        if info.get("hasIframe"):
-            logger.info("[EzSolver] Detected Turnstile challenge iframe; locating checkbox...")
-            try:
-                rect = self.driver.execute_script(
-                    """
-                    const frame = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                    if (!frame) return null;
-                    const r = frame.getBoundingClientRect();
-                    return { x: Math.round(r.left + 30), y: Math.round(r.top + r.height / 2) };
-                    """
-                )
+    def solve(self, timeout_sec: int = 25) -> bool:
+        """
+        Solves Cloudflare Turnstile challenge using EzSolver's coordinate calculation
+        and PyClick Bézier curves with natural overshoot and hold times.
+        """
+        logger.info("[EzSolver] Cloudflare Turnstile challenge detected! Initiating solve routine...")
+        start_time = time.time()
+        last_click_time = 0.0
+        click_attempts = 0
+
+        while time.time() - start_time < timeout_sec:
+            status = self.get_turnstile_status()
+            if status.get("isSolved"):
+                logger.info(f"[EzSolver] Turnstile verified! Token: {status['token'][:25]}...")
+                return True
+
+            if status.get("hasFailed"):
+                logger.info("[EzSolver] Captcha failed state detected; clicking retry button...")
+                self.mouse.move_to_element_and_click("#captchaTryAgainButton")
+                time.sleep(1.5)
+                continue
+
+            # If not active and not failed, it may have already cleared
+            if not status.get("isActive"):
+                logger.info("[EzSolver] Turnstile widget no longer active; challenge cleared.")
+                return True
+
+            now = time.time()
+            if now - last_click_time >= 4.0 and click_attempts < 5:
+                rect = status.get("iframeRect") or status.get("entryRect")
                 if rect:
-                    logger.info(f"[EzSolver] Moving cursor to Turnstile checkbox at ({rect['x']}, {rect['y']}) via PyClick...")
-                    self.mouse.move_to(rect["x"], rect["y"], duration_steps=random.randint(45, 65))
+                    # EzSolver exact checkbox position: 28px from left, vertically centered
+                    target_x = int(rect["x"] + 28 + random.uniform(-2, 2))
+                    target_y = int(rect["y"] + rect["h"] / 2 + random.uniform(-2, 2))
+
+                    logger.info(
+                        f"[EzSolver] Moving cursor to Turnstile checkbox at ({target_x}, {target_y}) via PyClick..."
+                    )
+                    # Approach curve with slight overshoot
+                    approach_x = target_x - random.randint(30, 60)
+                    approach_y = target_y - random.randint(10, 25)
+                    self.mouse.move_to(approach_x, approach_y, duration_steps=random.randint(25, 40))
+                    time.sleep(random.uniform(0.08, 0.15))
+                    self.mouse.move_to(target_x, target_y, duration_steps=random.randint(15, 25))
                     self.mouse.click()
-                    time.sleep(1.5)
-                    return True
-            except Exception:
-                pass
 
-        # If turnstile explicit API is available and token is needed
-        if info.get("hasTurnstileObj") and info.get("entryturnVisible"):
-            logger.info("[EzSolver] Invoking Turnstile render callback hook...")
-            try:
-                self.driver.execute_script(
-                    """
-                    if (window.turnstile && typeof window.turnstile.render === 'function') {
-                        try {
-                            window.turnstile.render('#entryturn', {
-                                callback: function(token) {
-                                    window._ezsolver_token = token;
-                                }
-                            });
-                        } catch(e) {}
-                    }
-                    """
-                )
-            except Exception:
-                pass
+                    last_click_time = now
+                    click_attempts += 1
+                    time.sleep(1.0)
+                else:
+                    time.sleep(0.5)
+            else:
+                time.sleep(0.4)
 
+        # Final check
+        final_status = self.get_turnstile_status()
+        if final_status.get("isSolved") or not final_status.get("isActive"):
+            return True
+
+        logger.warning(f"[EzSolver] Failed to solve Turnstile within {timeout_sec}s timeout.")
+        return False
+
+    def check_and_solve_turnstile(self) -> bool:
+        if self.is_turnstile_active():
+            return self.solve()
         return True
 
 
@@ -584,6 +671,49 @@ def create_stealth_driver(
         renderer="Intel Iris OpenGL Engine",
         fix_hairline=True,
     )
+
+    # Inject EzSolver shadow-piercing and Turnstile interceptor before any page scripts run
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+                // Hook attachShadow to pierce Cloudflare closed shadow DOM (EzSolver)
+                const origAttach = Element.prototype.attachShadow;
+                window._tsShadowRoots = [];
+                Element.prototype.attachShadow = function(init) {
+                    const root = origAttach.call(this, { ...init, mode: 'open' });
+                    window._tsShadowRoots.push(root);
+                    window._tsShadowRoot = root;
+                    return root;
+                };
+
+                // Intercept window.turnstile
+                let _turnstile = undefined;
+                Object.defineProperty(window, 'turnstile', {
+                    configurable: true,
+                    get: function() { return _turnstile; },
+                    set: function(val) {
+                        _turnstile = val;
+                        if (_turnstile && typeof _turnstile.render === 'function') {
+                            const origRender = _turnstile.render;
+                            _turnstile.render = function(container, params) {
+                                window._cf_sitekey = params ? params.sitekey : null;
+                                window._cf_container = container;
+                                window._cf_params = params;
+                                const widgetId = origRender.apply(this, arguments);
+                                window._cf_widgetId = widgetId;
+                                return widgetId;
+                            };
+                        }
+                    }
+                });
+                """
+            },
+        )
+    except Exception as e:
+        logger.debug(f"[Browser] Failed to add Page script on new document: {e}")
+
     return driver
 
 
@@ -687,8 +817,15 @@ class PowerlineBot:
 
     def enter_nickname_and_spawn(self) -> bool:
         """Enter nickname using PyClick Bézier curves and trigger spawn."""
-        self.turnstile.handle_gdpr_consent()
-        self.turnstile.check_and_solve_turnstile()
+        # 1. Check if Turnstile is active; solve it first!
+        if self.turnstile.is_turnstile_active():
+            self.log("[Turnstile] Challenge detected before spawn! Activating EzSolver...")
+            if not self.turnstile.solve():
+                self.log("[Turnstile] Failed to solve Turnstile; rotating proxy...")
+                self.rotate_to_next_proxy()
+                return False
+            self.log("[Turnstile] Challenge resolved successfully!")
+            time.sleep(0.5)
 
         self.driver.execute_script(
             """
@@ -702,6 +839,7 @@ class PowerlineBot:
             if (G) {
                 G.playClicks = 0;
                 G.focus = true;
+                if (G.network) G.network.nicknameModerationStatus = "";
             }
             """
         )
@@ -887,6 +1025,16 @@ class PowerlineBot:
                     self.log(f"Test duration reached ({max_duration}s). Stopping run.")
                     break
 
+                # 1. CRITICAL: Check Turnstile on every loop iteration
+                if self.turnstile.is_turnstile_active():
+                    self.log("[Turnstile] In-game challenge detected! Activating EzSolver...")
+                    if not self.turnstile.solve():
+                        self.log("[Turnstile] Challenge solve failed. Rotating proxy...")
+                        self.rotate_to_next_proxy()
+                        continue
+                    self.log("[Turnstile] Challenge resolved successfully!")
+                    time.sleep(0.5)
+
                 try:
                     state = self.driver.execute_script(
                         """
@@ -906,8 +1054,7 @@ class PowerlineBot:
                             alive: !!(lp && !lp.dead),
                             isDead: isDead,
                             score: G ? G.currentScore : 0,
-                            pos: lp ? { x: Math.round(lp.x), y: Math.round(lp.y) } : null,
-                            turnstileVisible: !!(document.getElementById('entryturn') && !document.getElementById('entryturn').hidden)
+                            pos: lp ? { x: Math.round(lp.x), y: Math.round(lp.y) } : null
                         };
                         """
                     )
@@ -925,16 +1072,19 @@ class PowerlineBot:
                 elif state.get("isDead"):
                     self.handle_respawn_if_dead()
                 else:
-                    spawn_attempts += 1
-                    self.log(f"In lobby; triggering spawn attempt #{spawn_attempts}...")
-                    self.enter_nickname_and_spawn()
-                    time.sleep(1.0)
+                    if self.turnstile.is_turnstile_active():
+                        self.turnstile.solve()
+                    else:
+                        spawn_attempts += 1
+                        self.log(f"In lobby; triggering spawn attempt #{spawn_attempts}...")
+                        self.enter_nickname_and_spawn()
+                        time.sleep(1.0)
 
                 # Periodic heartbeat log every 15 seconds
                 if now - last_heartbeat >= 15.0:
                     pos_str = f"({state['pos']['x']}, {state['pos']['y']})" if state.get("pos") else "N/A"
                     status_str = "ALIVE" if state.get("alive") else ("DEAD" if state.get("isDead") else "LOBBY")
-                    turnstile_str = "BLOCKED" if state.get("turnstileVisible") else "CLEAR"
+                    turnstile_str = "ACTIVE (SOLVING)" if self.turnstile.is_turnstile_active() else "CLEAR"
                     self.log(
                         f"[Heartbeat] Uptime={uptime}s/{max_duration or 'inf'}s | Status={status_str} | "
                         f"Score={state.get('score', 0)} | Pos={pos_str} | Turnstile={turnstile_str}"
