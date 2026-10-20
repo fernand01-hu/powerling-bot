@@ -24,6 +24,7 @@ Features:
 import argparse
 import base64
 import concurrent.futures
+import gzip
 import json
 import os
 import random
@@ -367,125 +368,124 @@ class LocalProxyForwarder:
 
 FLAGGED_IPS_FILE = os.path.join(tempfile.gettempdir(), "powerline_flagged_ips.txt")
 DIRECT_IP_LOCK = threading.Lock()
+DEFAULT_WEBSHARE_API_KEY = "REDACTED_WEBSHARE_API_KEY"
 
 
-class ProxyPool:
+def fetch_webshare_proxies(api_key, mode="direct", timeout=10.0):
     """
-    Coordinates proxy IP assignment across bots so that:
-    - Each proxy IP is used by at most `bots_per_ip` bots concurrently
-    - Automatically skips IPs recently flagged by Cloudflare Turnstile
-    - Provides a per-IP handshake lock (`get_ip_lock`) so bots sharing the same IP
-      do not hit Cloudflare Turnstile at the exact same millisecond
-    - When a bot rotates IP, it moves to a clean proxy IP with available capacity (< `bots_per_ip`).
+    Fetch active proxy list from Webshare API v2.
+    Returns list of dicts: [{'host': ..., 'port': ..., 'user': ..., 'pass': ..., 'country': ...}, ...]
     """
+    if not api_key:
+        return []
+    url = f"https://proxy.webshare.io/api/v2/proxy/list/?mode={mode}&page_size=100"
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "User-Agent": "PowerlineBot/1.0",
+    }
+    proxies = []
 
-    def __init__(self, proxies, bots_per_ip=2):
-        self.proxies = proxies
-        self.bots_per_ip = max(1, bots_per_ip)
-        self._lock = threading.Lock()
-        self._flagged_hosts = self._load_flagged_hosts()
-        self._ip_locks = {}
-        self._bot_assigned_host = {}
-        self._bot_visited_hosts = {}
+    # Method 1: requests library if available
+    try:
+        import requests
 
-    def get_ip_lock(self, proxy_info):
-        if not proxy_info:
-            return threading.Lock()
-        with self._lock:
-            host = proxy_info["host"]
-            if host not in self._ip_locks:
-                self._ip_locks[host] = threading.Lock()
-            return self._ip_locks[host]
+        cur_url = url
+        while cur_url:
+            resp = requests.get(cur_url, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            for item in data.get("results", []):
+                if item.get("valid", True):
+                    proxies.append(
+                        {
+                            "host": item["proxy_address"],
+                            "port": int(item["port"]),
+                            "user": item["username"],
+                            "pass": item["password"],
+                            "country": item.get("country_code", ""),
+                        }
+                    )
+            cur_url = data.get("next")
+        if proxies:
+            return proxies
+    except Exception:
+        pass
 
-    def _load_flagged_hosts(self):
-        flagged = set()
-        try:
-            if os.path.exists(FLAGGED_IPS_FILE):
-                if time.time() - os.path.getmtime(FLAGGED_IPS_FILE) < 600:
-                    with open(FLAGGED_IPS_FILE, "r", encoding="utf-8") as f:
-                        for line in f:
-                            h = line.strip()
-                            if h:
-                                flagged.add(h)
-        except Exception:
-            pass
-        return flagged
+    # Method 2: standard library urllib.request
+    try:
+        cur_url = url
+        while cur_url:
+            req = urllib.request.Request(cur_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                data = json.loads(raw.decode("utf-8"))
+                for item in data.get("results", []):
+                    if item.get("valid", True):
+                        proxies.append(
+                            {
+                                "host": item["proxy_address"],
+                                "port": int(item["port"]),
+                                "user": item["username"],
+                                "pass": item["password"],
+                                "country": item.get("country_code", ""),
+                            }
+                        )
+                cur_url = data.get("next")
+        return proxies
+    except Exception as e:
+        print(f"[!] Warning: Webshare API error: {e}")
+        return []
 
-    def is_flagged(self, proxy_info):
-        if not proxy_info:
-            return False
-        with self._lock:
-            return proxy_info["host"] in self._flagged_hosts
 
-    def mark_flagged(self, proxy_info):
-        if not proxy_info:
-            return
-        with self._lock:
-            host = proxy_info["host"]
-            self._flagged_hosts.add(host)
-            try:
-                with open(FLAGGED_IPS_FILE, "a", encoding="utf-8") as f:
-                    f.write(host + "\n")
-            except Exception:
-                pass
+def fetch_webshare_refresh_frequency(api_key, timeout=5.0):
+    """Fetch automatic refresh frequency (in seconds) from active Webshare plan."""
+    if not api_key:
+        return 300.0
+    url = "https://proxy.webshare.io/api/v2/subscription/plan/"
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "User-Agent": "PowerlineBot/1.0",
+    }
+    try:
+        import requests
 
-    def _host_active_count(self, host, exclude_instance_id=None):
-        return sum(
-            1
-            for inst_id, h in self._bot_assigned_host.items()
-            if h == host and inst_id != exclude_instance_id
-        )
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            for plan in data.get("results", []):
+                if plan.get("status") == "active":
+                    freq = plan.get("automatic_refresh_frequency")
+                    if freq and freq > 0:
+                        return float(freq)
+    except Exception:
+        pass
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for plan in data.get("results", []):
+                if plan.get("status") == "active":
+                    freq = plan.get("automatic_refresh_frequency")
+                    if freq and freq > 0:
+                        return float(freq)
+    except Exception:
+        pass
+    return 300.0
 
-    def _pick_best_proxy(self, instance_id):
-        visited = self._bot_visited_hosts.setdefault(instance_id, set())
-        cur_host = self._bot_assigned_host.get(instance_id)
 
-        clean = [p for p in self.proxies if p["host"] not in self._flagged_hosts]
-        candidates = clean if clean else self.proxies
-
-        if len(visited) >= len(candidates):
-            visited.clear()
-
-        # 1. Prefer unvisited clean proxy IPs that currently have < bots_per_ip active bots
-        for p in candidates:
-            h = p["host"]
-            if h != cur_host and h not in visited and self._host_active_count(h, instance_id) < self.bots_per_ip:
-                self._bot_assigned_host[instance_id] = h
-                visited.add(h)
-                return p
-
-        # 2. Any clean proxy IP that currently has < bots_per_ip active bots
-        for p in candidates:
-            h = p["host"]
-            if h != cur_host and self._host_active_count(h, instance_id) < self.bots_per_ip:
-                self._bot_assigned_host[instance_id] = h
-                visited.add(h)
-                return p
-
-        # 3. Fallback: proxy with the fewest active bots
-        best = min(
-            candidates,
-            key=lambda p: (p["host"] == cur_host, self._host_active_count(p["host"], instance_id)),
-        )
-        self._bot_assigned_host[instance_id] = best["host"]
-        visited.add(best["host"])
-        return best
-
-    def get_initial_proxy(self, instance_id, num_instances=4):
-        if not self.proxies:
-            return None
-        with self._lock:
-            return self._pick_best_proxy(instance_id)
-
-    def rotate_proxy(self, instance_id, num_instances=4):
-        if not self.proxies:
-            return None
-        with self._lock:
-            return self._pick_best_proxy(instance_id)
-
-    def release_bot(self, instance_id):
-        with self._lock:
-            self._bot_assigned_host.pop(instance_id, None)
+def save_proxies_to_file(proxies, file_path):
+    """Save proxy list to a text file in host:port:user:pass format."""
+    if not proxies or not file_path:
+        return
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            for p in proxies:
+                f.write(f"{p['host']}:{p['port']}:{p['user']}:{p['pass']}\n")
+    except Exception as e:
+        print(f"[!] Warning: Failed saving proxies to '{file_path}': {e}")
 
 
 def load_proxies(proxy_file):
@@ -598,6 +598,226 @@ def filter_working_proxies(proxies, target_server_host, target_server_port, time
             print(f"    - {p['host']}:{p['port']} ({reason})")
 
     return working
+
+
+class ProxyPool:
+    """
+    Coordinates proxy IP assignment across bots so that:
+    - Each proxy IP is used by at most `bots_per_ip` bots concurrently
+    - Automatically skips IPs recently flagged by Cloudflare Turnstile
+    - Periodically syncs with Webshare API to pick up new rotating IPs every 5 minutes
+    - Dynamically tests newly rotated proxies before assigning them to bots
+    - Provides a per-IP handshake lock (`get_ip_lock`) so bots sharing the same IP
+      do not hit Cloudflare Turnstile at the exact same millisecond
+    - When a bot rotates IP, it moves to a clean proxy IP with available capacity (< `bots_per_ip`).
+    """
+
+    def __init__(
+        self,
+        proxies,
+        bots_per_ip=2,
+        webshare_api_key=None,
+        target_srv_host=None,
+        target_srv_port=None,
+        proxy_file=None,
+        sync_interval=45.0,
+    ):
+        self.proxies = list(proxies) if proxies else []
+        self.bots_per_ip = max(1, bots_per_ip)
+        self.webshare_api_key = webshare_api_key
+        self.target_srv_host = target_srv_host
+        self.target_srv_port = target_srv_port
+        self.proxy_file = proxy_file
+        self.sync_interval = max(10.0, float(sync_interval))
+        self._lock = threading.Lock()
+        self._flagged_hosts = self._load_flagged_hosts()
+        self._ip_locks = {}
+        self._bot_assigned_host = {}
+        self._bot_visited_hosts = {}
+        self._stopped = False
+        self._sync_thread = None
+
+        if self.webshare_api_key and self.target_srv_host and self.target_srv_port:
+            self._sync_thread = threading.Thread(
+                target=self._background_sync_loop, daemon=True, name="Webshare-Sync"
+            )
+            self._sync_thread.start()
+
+    def stop(self):
+        self._stopped = True
+
+    def _background_sync_loop(self):
+        while not self._stopped:
+            time.sleep(self.sync_interval)
+            if self._stopped:
+                break
+            try:
+                self.sync_webshare_proxies()
+            except Exception:
+                pass
+
+    def sync_webshare_proxies(self, force=False):
+        if not self.webshare_api_key:
+            return False
+
+        try:
+            fetched = fetch_webshare_proxies(self.webshare_api_key)
+        except Exception:
+            return False
+
+        if not fetched:
+            return False
+
+        with self._lock:
+            current_keys = {(p["host"], p["port"]) for p in self.proxies}
+            fetched_keys = {(p["host"], p["port"]) for p in fetched}
+
+        if fetched_keys == current_keys and not force:
+            return False
+
+        untested = [p for p in fetched if (p["host"], p["port"]) not in current_keys]
+        verified_untested = []
+        if untested and self.target_srv_host and self.target_srv_port:
+            print("[*] [Webshare Sync] New rotating proxy IPs detected; testing against game server...")
+            verified_untested = filter_working_proxies(
+                untested, self.target_srv_host, self.target_srv_port
+            )
+        else:
+            verified_untested = untested
+
+        verified_keys = {(p["host"], p["port"]) for p in verified_untested}
+        new_pool = []
+        for p in fetched:
+            k = (p["host"], p["port"])
+            if k in verified_keys or (k in current_keys and p["host"] not in self._flagged_hosts):
+                new_pool.append(p)
+
+        if not new_pool:
+            new_pool = verified_untested if verified_untested else fetched
+
+        with self._lock:
+            self.proxies = new_pool
+            new_hosts = {p["host"] for p in new_pool}
+            for bot_id, visited in self._bot_visited_hosts.items():
+                visited.intersection_update(new_hosts)
+
+        if self.proxy_file:
+            save_proxies_to_file(new_pool, self.proxy_file)
+            for legacy in ("Webshare 10 proxies(4).txt", "Webshare 10 proxies(5).txt"):
+                if os.path.exists(legacy) and legacy != self.proxy_file:
+                    save_proxies_to_file(new_pool, legacy)
+
+        new_host_str = ", ".join(p["host"] for p in new_pool)
+        print(
+            f"\n[+] [Webshare Auto-Sync] Proxy pool updated with rotated IPs! "
+            f"({len(new_pool)} active verified proxies: {new_host_str})\n"
+        )
+        return True
+
+    def get_ip_lock(self, proxy_info):
+        if not proxy_info:
+            return threading.Lock()
+        with self._lock:
+            host = proxy_info["host"]
+            if host not in self._ip_locks:
+                self._ip_locks[host] = threading.Lock()
+            return self._ip_locks[host]
+
+    def _load_flagged_hosts(self):
+        flagged = set()
+        try:
+            if os.path.exists(FLAGGED_IPS_FILE):
+                if time.time() - os.path.getmtime(FLAGGED_IPS_FILE) < 600:
+                    with open(FLAGGED_IPS_FILE, "r", encoding="utf-8") as f:
+                        for line in f:
+                            h = line.strip()
+                            if h:
+                                flagged.add(h)
+        except Exception:
+            pass
+        return flagged
+
+    def is_flagged(self, proxy_info):
+        if not proxy_info:
+            return False
+        with self._lock:
+            return proxy_info["host"] in self._flagged_hosts
+
+    def mark_flagged(self, proxy_info):
+        if not proxy_info:
+            return
+        with self._lock:
+            host = proxy_info["host"]
+            self._flagged_hosts.add(host)
+            try:
+                with open(FLAGGED_IPS_FILE, "a", encoding="utf-8") as f:
+                    f.write(host + "\n")
+            except Exception:
+                pass
+
+    def _host_active_count(self, host, exclude_instance_id=None):
+        return sum(
+            1
+            for inst_id, h in self._bot_assigned_host.items()
+            if h == host and inst_id != exclude_instance_id
+        )
+
+    def _pick_best_proxy(self, instance_id):
+        visited = self._bot_visited_hosts.setdefault(instance_id, set())
+        cur_host = self._bot_assigned_host.get(instance_id)
+
+        clean = [p for p in self.proxies if p["host"] not in self._flagged_hosts]
+        candidates = clean if clean else self.proxies
+
+        if len(visited) >= len(candidates):
+            visited.clear()
+
+        # 1. Prefer unvisited clean proxy IPs that currently have < bots_per_ip active bots
+        for p in candidates:
+            h = p["host"]
+            if h != cur_host and h not in visited and self._host_active_count(h, instance_id) < self.bots_per_ip:
+                self._bot_assigned_host[instance_id] = h
+                visited.add(h)
+                return p
+
+        # 2. Any clean proxy IP that currently has < bots_per_ip active bots
+        for p in candidates:
+            h = p["host"]
+            if h != cur_host and self._host_active_count(h, instance_id) < self.bots_per_ip:
+                self._bot_assigned_host[instance_id] = h
+                visited.add(h)
+                return p
+
+        # 3. Fallback: proxy with the fewest active bots
+        best = min(
+            candidates,
+            key=lambda p: (p["host"] == cur_host, self._host_active_count(p["host"], instance_id)),
+        )
+        self._bot_assigned_host[instance_id] = best["host"]
+        visited.add(best["host"])
+        return best
+
+    def get_initial_proxy(self, instance_id, num_instances=4):
+        if not self.proxies and self.webshare_api_key:
+            self.sync_webshare_proxies(force=True)
+        if not self.proxies:
+            return None
+        with self._lock:
+            return self._pick_best_proxy(instance_id)
+
+    def rotate_proxy(self, instance_id, num_instances=4):
+        with self._lock:
+            clean = [p for p in self.proxies if p["host"] not in self._flagged_hosts]
+        if not clean and self.webshare_api_key:
+            self.sync_webshare_proxies(force=True)
+        if not self.proxies:
+            return None
+        with self._lock:
+            return self._pick_best_proxy(instance_id)
+
+    def release_bot(self, instance_id):
+        with self._lock:
+            self._bot_assigned_host.pop(instance_id, None)
 
 
 def resolve_game_server_endpoint(server_arg=None, resolved_srv=None):
@@ -1677,7 +1897,9 @@ def run_bot_instance(
 def run_multi_bots(
     instances=4,
     bots_per_ip=2,
-    proxy_file="Webshare 10 proxies(4).txt",
+    proxy_file="webshare_proxies.txt",
+    webshare_api_key=DEFAULT_WEBSHARE_API_KEY,
+    webshare_sync_interval=45.0,
     ip_rotate_seconds=300.0,
     server_arg=None,
     minimize=False,
@@ -1688,18 +1910,44 @@ def run_multi_bots(
     keep_open=3.0,
     allow_direct=False,
 ):
-    proxies = load_proxies(proxy_file)
+    proxies = []
+    if webshare_api_key:
+        auto_freq = fetch_webshare_refresh_frequency(webshare_api_key)
+        if ip_rotate_seconds == 300.0 and auto_freq > 0:
+            ip_rotate_seconds = auto_freq
+        print(f"[*] Webshare API active: loaded plan auto-rotation frequency ({auto_freq:g}s).")
+        print("[*] Fetching live proxy pool from Webshare API...")
+        proxies = fetch_webshare_proxies(webshare_api_key)
+        if proxies:
+            print(f"[+] Loaded {len(proxies)} rotating proxies from Webshare API.")
+            save_proxies_to_file(proxies, proxy_file)
+            for legacy in ("Webshare 10 proxies(4).txt", "Webshare 10 proxies(5).txt"):
+                if os.path.exists(legacy) and legacy != proxy_file:
+                    save_proxies_to_file(proxies, legacy)
+        else:
+            print(f"[!] Warning: Could not fetch from Webshare API; checking local cache '{proxy_file}'...")
+
+    if not proxies:
+        proxies = load_proxies(proxy_file)
+        if not proxies:
+            for legacy in ("Webshare 10 proxies(4).txt", "Webshare 10 proxies(5).txt"):
+                if os.path.exists(legacy):
+                    proxies = load_proxies(legacy)
+                    if proxies:
+                        proxy_file = legacy
+                        break
+
     if proxies:
         print(
-            f"[*] Loaded {len(proxies)} proxies from '{proxy_file}' "
+            f"[*] Active proxy pool: {len(proxies)} proxies "
             f"({bots_per_ip} bots per IP, rotating IP every ~{ip_rotate_seconds:g}s)."
         )
     else:
         if not allow_direct:
-            print(f"[!] Error: No proxies loaded from '{proxy_file}'.")
+            print(f"[!] Error: No proxies available from Webshare API or '{proxy_file}'.")
             print("[!] Refusing to use your direct IP without explicit --allow-direct flag.")
             sys.exit(1)
-        print(f"[!] No proxies loaded from '{proxy_file}'; running with direct connection (--allow-direct).")
+        print(f"[!] No proxies loaded; running with direct connection (--allow-direct).")
 
     target_url, resolved_srv = build_target_url(server_arg)
     if resolved_srv:
@@ -1710,6 +1958,7 @@ def run_multi_bots(
     elif server_arg:
         print(f"[*] Target server selection: '{server_arg}'")
 
+    srv_host, srv_port = None, None
     if proxies:
         srv_host, srv_port = resolve_game_server_endpoint(server_arg, resolved_srv)
         working_proxies = filter_working_proxies(proxies, srv_host, srv_port)
@@ -1733,7 +1982,19 @@ def run_multi_bots(
         print("[*] Window mode: Background (will not steal focus from your active window)")
 
     cache_seed_dir = ensure_http_cache_seed()
-    proxy_pool = ProxyPool(proxies, bots_per_ip=bots_per_ip) if proxies else None
+    proxy_pool = (
+        ProxyPool(
+            proxies=proxies,
+            bots_per_ip=bots_per_ip,
+            webshare_api_key=webshare_api_key,
+            target_srv_host=srv_host,
+            target_srv_port=srv_port,
+            proxy_file=proxy_file,
+            sync_interval=webshare_sync_interval,
+        )
+        if proxies
+        else None
+    )
     threads = []
 
     for i in range(1, instances + 1):
@@ -1760,13 +2021,17 @@ def run_multi_bots(
         threads.append(t)
         t.start()
 
-    for t in threads:
-        t.join()
+    try:
+        for t in threads:
+            t.join()
+    finally:
+        if proxy_pool:
+            proxy_pool.stop()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Humanized Multi-instance Powerline.io Bot with Proxy Data Saver & Minimize Mode"
+        description="Humanized Multi-instance Powerline.io Bot with Webshare Rotating Proxies & Data Saver"
     )
     parser.add_argument(
         "--list-servers",
@@ -1788,9 +2053,25 @@ if __name__ == "__main__":
     parser.add_argument("--instances", type=int, default=4, help="Number of concurrent bot instances")
     parser.add_argument("--bots-per-ip", type=int, default=2, help="Number of bots sharing each proxy IP")
     parser.add_argument(
+        "--webshare-api-key",
+        default=os.environ.get("WEBSHARE_API_KEY", DEFAULT_WEBSHARE_API_KEY),
+        help="Webshare API Key for automatic proxy fetching and 5-min rotation sync (default: preconfigured)",
+    )
+    parser.add_argument(
+        "--no-webshare-api",
+        action="store_true",
+        help="Disable Webshare API fetching and live sync (forces loading purely from --proxy-file)",
+    )
+    parser.add_argument(
+        "--webshare-sync-interval",
+        type=float,
+        default=45.0,
+        help="Seconds between polling Webshare API for proxy rotation (default: 45s)",
+    )
+    parser.add_argument(
         "--proxy-file",
-        default="Webshare 10 proxies(4).txt",
-        help="Path to Webshare proxy list file (host:port:user:pass)",
+        default="webshare_proxies.txt",
+        help="Path to Webshare proxy list cache file (host:port:user:pass)",
     )
     parser.add_argument(
         "--ip-rotate-seconds",
@@ -1814,10 +2095,14 @@ if __name__ == "__main__":
         list_available_servers()
         sys.exit(0)
 
+    webshare_key = None if args.no_webshare_api else (args.webshare_api_key or None)
+
     run_multi_bots(
         instances=args.instances,
         bots_per_ip=args.bots_per_ip,
         proxy_file=args.proxy_file,
+        webshare_api_key=webshare_key,
+        webshare_sync_interval=args.webshare_sync_interval,
         ip_rotate_seconds=args.ip_rotate_seconds,
         server_arg=args.server,
         minimize=args.minimize,

@@ -7,12 +7,16 @@ A humanized, multi-instance browser bot for [powerline.io](https://powerline.io/
 ## Features
 
 - **Multi-Instance Execution**: Launch multiple bots concurrently (default: `4` instances) in separate threads.
+- **Live Webshare Rotating Proxy Sync**:
+  - Direct Webshare API v2 integration with preconfigured API key and auto-discovery.
+  - Automatically fetches the active rotating proxy pool on startup and detects your plan's rotation frequency (`300s` = 5 minutes).
+  - Background live synchronizer continuously detects rotated IPs from Webshare every 45s, pre-checks them against the game server, and hot-swaps them into the pool.
+  - Caches live proxies locally to `webshare_proxies.txt` for offline fallback.
 - **Pre-Flight Proxy Health Check & Filtering**:
   - Automatically verifies all proxies in parallel against the target game server's WebSocket endpoint in ~1.5 seconds on startup.
   - Skips any proxy IPs rejected with `400 Bad Request` or connect errors by the game server, ensuring only 100% verified working IPs are assigned.
   - Automatically calculates capacity and adjusts `--bots-per-ip` if necessary so all requested bot instances run reliably.
 - **Proxy Pool & Automatic IP Rotation**:
-  - Reads `host:port:username:password` proxies from a text file (default: `Webshare 10 proxies(4).txt`).
   - Distributes bots evenly across active verified proxies.
   - Rotates each bot to a fresh proxy IP every **5 minutes** (`--ip-rotate-seconds 300` with ±8% human jitter) without restarting Chrome.
   - Automatically detects and skips proxy IPs that trigger a persistent Cloudflare Turnstile challenge.
@@ -118,7 +122,10 @@ python3 bot.py --server "Europe" --ip-rotate-seconds 120 --minimize
 | `-m`, `--minimize` | `False` | Minimize/hide all bot Chrome windows while keeping the game loop running at 60 FPS. |
 | `--instances` | `4` | Number of concurrent bot instances to run. |
 | `--bots-per-ip` | `2` | Maximum number of bots sharing each proxy IP simultaneously. |
-| `--proxy-file` | `"Webshare 10 proxies(4).txt"` | Path to the proxy list file (`host:port:user:pass`). If missing, connects directly. |
+| `--webshare-api-key` | Preconfigured | Webshare API Key for automatic proxy fetching and 5-min rotation sync. |
+| `--no-webshare-api` | `False` | Disable Webshare API calls and run purely from local `--proxy-file`. |
+| `--webshare-sync-interval` | `45.0` | Seconds between polling Webshare API for proxy rotation. |
+| `--proxy-file` | `"webshare_proxies.txt"` | Path to the proxy list cache file (`host:port:user:pass`). |
 | `--ip-rotate-seconds` | `300.0` | Seconds before each bot rotates to a new proxy IP (`300` = 5 minutes ± jitter). Set to `0` to disable rotation. |
 | `--nick` | `"CircleBot"` | Base nickname for the bots (`CircleBot1`, `CircleBot2`, ...). |
 | `--loops` | `4` | Number of rounds (spawn -> circle -> press `K` to self-destruct) each bot plays. |
