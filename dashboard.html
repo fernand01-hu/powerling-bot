@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Powerline Bots</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel-2: #1c232d; --border: #2a3340;
+    --text: #e6edf3; --muted: #8b98a8; --accent: #2ee6c8; --accent-dim: #19756a;
+    --good: #3fb950; --warn: #d29922; --bad: #f85149; --info: #58a6ff; --idle: #8b98a8;
+    --shadow: 0 1px 0 rgba(255,255,255,0.03) inset;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f8; --panel: #ffffff; --panel-2: #f0f3f6; --border: #d6dde5;
+      --text: #1b2430; --muted: #5d6b7c; --accent: #0f9e88; --accent-dim: #b8ebe2;
+      --good: #1a7f37; --warn: #9a6700; --bad: #cf222e; --info: #0969da; --idle: #6e7781;
+      --shadow: none;
+      color-scheme: light;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+           padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .3px; }
+  header h1 span { color: var(--accent); }
+  .meta { color: var(--muted); font-size: 13px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--bad); margin-right: 6px; }
+  .dot.ok { background: var(--good); }
+  main { max-width: 1280px; margin: 0 auto; padding: 18px 16px 40px; display: grid; gap: 16px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile, section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
+  .tile { padding: 14px 16px; }
+  .tile .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+  .tile .value { font-size: 26px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  section { padding: 14px 16px; min-width: 0; }
+  section h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+               display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+  @media (max-width: 860px) { .grid-2 { grid-template-columns: minmax(0, 1fr); } }
+  .machines { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+  .machine { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .machine.paused { opacity: .65; }
+  .machine .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .machine .name { font-weight: 600; overflow-wrap: anywhere; }
+  .badge { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .bar { height: 7px; border-radius: 4px; background: var(--border); overflow: hidden; margin: 4px 0 8px; }
+  .bar > div { height: 100%; background: var(--accent); transition: width .4s; }
+  .bar.hot > div { background: var(--bad); }
+  .bar.warm > div { background: var(--warn); }
+  .kv { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  button { font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 6px; cursor: pointer;
+           background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  input[type=number] { width: 70px; font: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px;
+                       background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  .s-playing::before { background: var(--good); }
+  .s-dead::before, .s-lobby::before { background: var(--info); }
+  .s-connecting::before, .s-loading::before, .s-starting::before, .s-waiting::before { background: var(--warn); }
+  .s-stopped::before { background: var(--idle); }
+  .muted { color: var(--muted); }
+  .countdown { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .events { max-height: 260px; overflow-y: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .events div { padding: 2px 0; border-bottom: 1px dashed var(--border); overflow-wrap: anywhere; }
+  .events .WARNING { color: var(--warn); }
+  .events .ERROR { color: var(--bad); }
+  .toast { position: fixed; bottom: 16px; right: 16px; background: var(--panel); border: 1px solid var(--accent);
+           padding: 8px 12px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>&#9650;</span> Powerline Bots</h1>
+  <div class="meta">
+    <span><span id="conn" class="dot"></span><span id="conn-text">connecting…</span></span>
+    <span>Room <b id="room">–</b></span>
+    <span>Code <span id="version">–</span></span>
+  </div>
+</header>
+
+<main>
+  <div class="tiles">
+    <div class="tile"><div class="label">Playing</div><div class="value" id="t-playing">–</div><div class="sub" id="t-total">of – bots</div></div>
+    <div class="tile"><div class="label">Not in game</div><div class="value" id="t-other">–</div><div class="sub" id="t-other-sub">–</div></div>
+    <div class="tile"><div class="label">Machines</div><div class="value" id="t-machines">–</div><div class="sub" id="t-machines-sub">–</div></div>
+    <div class="tile"><div class="label">Rounds played</div><div class="value" id="t-rounds">–</div><div class="sub">since each bot started</div></div>
+    <div class="tile">
+      <div class="label">Next IP change</div>
+      <div class="countdown" id="t-rotation">–</div>
+      <div class="bar"><div id="t-rotation-bar" style="width:0"></div></div>
+      <div class="sub" id="t-rotation-sub">–</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Machines</h2>
+    <div class="machines" id="machines"></div>
+  </section>
+
+  <section>
+    <h2>
+      <span>Bots</span>
+      <span class="row" style="margin:0">
+        <button class="danger" data-action="stop_all">Stop all</button>
+        <button data-action="start_all">Start all</button>
+      </span>
+    </h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Name</th><th>State</th><th>For</th><th>Machine</th><th>Group</th><th>IP</th><th>Rounds</th><th>Last respawn</th><th></th></tr></thead>
+        <tbody id="bots"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="grid-2">
+    <section>
+      <h2>
+        <span>Proxies</span>
+        <button data-action="refresh_proxies">Refresh now</button>
+      </h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>IP</th><th>Country</th><th>Used by</th><th>Status</th></tr></thead>
+          <tbody id="proxies"></tbody>
+        </table>
+      </div>
+      <div class="row">
+        <span class="muted">Groups (one IP each, <span id="bpp">–</span> bots per group)</span>
+        <input type="number" id="groups-input" min="1" max="50">
+        <button class="primary" id="groups-set">Set</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Events</h2>
+      <div class="events" id="events"></div>
+    </section>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+let state = null;
+let serverOffset = 0;  // Server clock minus browser clock, so countdowns match the coordinator
+let editingGroups = false;
+
+function ago(seconds) {
+  if (seconds == null || !isFinite(seconds)) return "–";
+  seconds = Math.max(0, Math.round(seconds));
+  if (seconds < 60) return seconds + "s";
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  if (m < 60) return m + "m " + String(s).padStart(2, "0") + "s";
+  return Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m";
+}
+const now = () => Date.now() / 1000 + serverOffset;
+
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 1800);
+}
+
+async function command(cmd, label) {
+  try {
+    const res = await fetch("/api/command", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Requested-With": "dashboard"},
+      body: JSON.stringify(cmd),
+    });
+    toast(res.ok ? (label || "Sent") : "Failed: " + res.status);
+    setTimeout(refresh, 1200);
+  } catch (e) {
+    toast("Failed: " + e);
+  }
+}
+
+function renderTiles() {
+  const bots = state.bots;
+  const counts = {};
+  bots.forEach((b) => counts[b.state] = (counts[b.state] || 0) + 1);
+  $("t-playing").textContent = counts.playing || 0;
+  $("t-total").textContent = "of " + bots.length + " bots";
+  const other = bots.length - (counts.playing || 0);
+  $("t-other").textContent = other;
+  $("t-other-sub").textContent = Object.entries(counts).filter(([k]) => k !== "playing")
+    .map(([k, v]) => v + " " + k).join(" · ") || "all playing";
+  const paused = state.machines.filter((m) => m.paused).length;
+  $("t-machines").textContent = state.machines.length;
+  $("t-machines-sub").textContent = paused ? paused + " paused" : "all active";
+  $("t-rounds").textContent = bots.reduce((n, b) => n + (b.rounds || 0), 0);
+  $("room").textContent = "#" + state.room;
+  $("version").textContent = state.code_version;
+}
+
+function renderRotation() {
+  if (!state) return;
+  const next = state.next_rotation, freq = state.rotation_frequency;
+  if (!next || !freq) {
+    $("t-rotation").textContent = "–";
+    $("t-rotation-sub").textContent = "rotation time unknown";
+    return;
+  }
+  const left = next - now();
+  $("t-rotation").textContent = left > 0 ? ago(left) : "due";
+  $("t-rotation-bar").style.width = Math.min(100, Math.max(0, (1 - left / freq) * 100)) + "%";
+  $("t-rotation-sub").textContent = "every " + ago(freq) + " · list checked " + ago(now() - state.last_fetch) + " ago";
+}
+
+function renderMachines() {
+  const el = $("machines");
+  if (el.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;  // Don't wipe a value being typed
+  if (!state.machines.length) {
+    el.innerHTML = '<div class="muted">No machines connected.</div>';
+    return;
+  }
+  el.innerHTML = state.machines.map((m) => {
+    const cpuClass = m.cpu >= 85 ? "hot" : m.cpu >= 65 ? "warm" : "";
+    const memUsed = m.mem_total_mb ? 100 * (1 - m.mem_available_mb / m.mem_total_mb) : 0;
+    const limit = m.max_bots == null ? "" : m.max_bots;
+    return `<div class="machine ${m.paused ? "paused" : ""}">
+      <div class="top"><span class="name">${esc(m.name)}</span>
+        <span class="badge">${esc(m.platform || "?")}${m.local ? " · coordinator" : ""}${m.paused ? " · paused" : ""}</span></div>
+      <div class="kv" style="margin-top:8px"><span>CPU (${m.cpu_count} threads)</span><span>${m.cpu.toFixed(0)}%</span></div>
+      <div class="bar ${cpuClass}"><div style="width:${Math.min(100, m.cpu)}%"></div></div>
+      <div class="kv"><span>RAM</span><span>${m.mem_total_mb ? ((m.mem_total_mb - m.mem_available_mb) / 1024).toFixed(1) + " / " + (m.mem_total_mb / 1024).toFixed(1) + " GB" : "–"}</span></div>
+      <div class="bar"><div style="width:${memUsed}%"></div></div>
+      <div class="kv"><span>Bots</span><span>${m.bots.length}${m.max_bots != null ? " / max " + m.max_bots : ""}</span></div>
+      <div class="row">
+        ${m.paused
+          ? `<button class="primary" data-cmd='${esc(JSON.stringify({action: "resume_machine", machine: m.name}))}'>Resume</button>`
+          : `<button class="danger" data-cmd='${esc(JSON.stringify({action: "pause_machine", machine: m.name}))}'>Pause</button>`}
+        <span class="muted">Max bots</span>
+        <input type="number" min="0" max="100" placeholder="∞" value="${limit}" data-max-for="${esc(m.name)}">
+        <button data-set-max="${esc(m.name)}">Set</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderBots() {
+  $("bots").innerHTML = state.bots.map((b) => {
+    const running = !["stopped", "waiting"].includes(b.state) && b.machine;
+    const since = b.since ? ago(now() - b.since) : "–";
+    const actions = b.state === "stopped"
+      ? `<button class="primary" data-cmd='${esc(JSON.stringify({action: "start_bot", bot: b.id}))}'>Start</button>`
+      : `<button data-cmd='${esc(JSON.stringify({action: "restart_bot", bot: b.id}))}'>Restart</button>
+         <button class="danger" data-cmd='${esc(JSON.stringify({action: "stop_bot", bot: b.id}))}'>Stop</button>`;
+    return `<tr>
+      <td class="muted">${b.id}</td>
+      <td>${esc(b.name)}</td>
+      <td><span class="pill s-${esc(b.state)}">${esc(b.state)}</span>${b.failures > 1 ? ` <span class="badge">${b.failures} fails</span>` : ""}</td>
+      <td class="muted">${running ? since : "–"}</td>
+      <td>${esc(b.machine || "–")}</td>
+      <td>${b.group}</td>
+      <td class="muted">${esc(b.proxy || "–")}</td>
+      <td>${b.rounds || 0}</td>
+      <td>${b.last_respawn != null ? b.last_respawn.toFixed(1) + "s" : "–"}</td>
+      <td style="text-align:right">${actions}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderProxies() {
+  $("proxies").innerHTML = state.proxies.map((p) => `<tr>
+    <td>${esc(p.host)}<span class="muted">:${esc(p.port)}</span></td>
+    <td>${esc(p.country || "–")}</td>
+    <td>${p.groups.length ? "group " + p.groups.join(", ") : '<span class="muted">unused</span>'}</td>
+    <td>${p.benched_until ? `<span class="pill s-connecting">benched ${ago(p.benched_until - now())}</span>` : '<span class="pill s-playing">ok</span>'}</td>
+  </tr>`).join("") || '<tr><td colspan="4" class="muted">No proxies.</td></tr>';
+  $("bpp").textContent = state.bots_per_proxy;
+  if (!editingGroups) $("groups-input").value = state.groups;
+}
+
+function renderEvents() {
+  $("events").innerHTML = state.events.slice().reverse().map((e) => {
+    const t = new Date(e.time * 1000).toLocaleTimeString();
+    return `<div class="${esc(e.level)}"><span class="muted">${t}</span> ${esc(e.message.replace(/^\[Coordinator\] /, ""))}</div>`;
+  }).join("") || '<div class="muted">No events yet.</div>';
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/state", {cache: "no-store"});
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    if (!data.time) throw new Error("coordinator still starting");
+    state = data;
+    serverOffset = state.time - Date.now() / 1000;
+    $("conn").classList.add("ok");
+    $("conn-text").textContent = "live · updated " + new Date().toLocaleTimeString();
+    renderTiles(); renderMachines(); renderBots(); renderProxies(); renderEvents(); renderRotation();
+  } catch (e) {
+    $("conn").classList.remove("ok");
+    $("conn-text").textContent = "no data (" + e.message + ")";
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  if (btn.dataset.action) {
+    if (btn.dataset.action === "stop_all" && !confirm("Stop every bot?")) return;
+    command({action: btn.dataset.action}, btn.textContent.trim());
+  } else if (btn.dataset.cmd) {
+    command(JSON.parse(btn.dataset.cmd), btn.textContent.trim());
+  } else if (btn.dataset.setMax !== undefined) {
+    const input = document.querySelector(`input[data-max-for="${CSS.escape(btn.dataset.setMax)}"]`);
+    const value = input.value === "" ? null : Number(input.value);
+    command({action: "set_max_bots", machine: btn.dataset.setMax, max_bots: value}, "Limit set");
+  } else if (btn.id === "groups-set") {
+    const groups = Number($("groups-input").value);
+    if (groups >= 1 && groups <= 50) command({action: "set_groups", groups}, "Groups set to " + groups);
+    editingGroups = false;
+  }
+});
+$("groups-input").addEventListener("focus", () => editingGroups = true);
+$("groups-input").addEventListener("blur", () => setTimeout(() => editingGroups = false, 300));
+
+refresh();
+setInterval(refresh, 2000);
+setInterval(renderRotation, 1000);
+</script>
+</body>
+</html>

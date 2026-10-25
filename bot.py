@@ -59,6 +59,7 @@ BAD_PROXY_EXIT = 3                   # Worker exit code: its proxy can't reach t
 MAX_FAILED_RELOADS = 2               # Stuck reloads in a row without reaching the game -> bad proxy
 STOP_WORKER = "stop"                 # Sent on a worker's update queue to make it close its browser and exit
 IS_WINDOWS = sys.platform == "win32"
+STATUS_INTERVAL = 5.0                # Seconds between status reports while a bot's state doesn't change
 WINDOW_SIZE = (720, 480)        # Browser window size
 MIN_HOLD = 0.28                 # Shortest time a direction is held
 
@@ -265,6 +266,7 @@ class PowerlineBot:
         nickname: Optional[str] = None,
         proxy_updates: Optional["multiprocessing.Queue"] = None,
         debug_dir: Optional[str] = None,
+        reports: Optional["multiprocessing.Queue"] = None,
     ):
         self.instance_id = instance_id
         self.log_prefix = f"[Bot-{instance_id}]"
@@ -275,8 +277,39 @@ class PowerlineBot:
         self.proxy_updates = proxy_updates
         self.pending_proxy: Optional[Dict[str, str]] = None
         self.debug_dir = debug_dir
+        self.reports = reports
         self.target_url = f"https://powerline.io/#{self.room}"
         self.humanizer: Optional[Humanizer] = None
+        # What this bot is doing, reported to the agent for the coordinator's dashboard.
+        self.state = "starting"
+        self.state_since = time.time()
+        self.last_status = 0.0
+        self.rounds = 0
+        self.last_respawn: Optional[float] = None
+
+    def set_state(self, state: str, force: bool = False):
+        """Report the bot's state (loading, connecting, lobby, playing, dead); at most every
+        STATUS_INTERVAL seconds unless it changes."""
+        now = time.time()
+        if state == self.state and not force and now - self.last_status < STATUS_INTERVAL:
+            return
+        if state != self.state:
+            self.state_since = now
+        self.state, self.last_status = state, now
+        if self.reports is None:
+            return
+        try:
+            self.reports.put_nowait({"bot": self.instance_id, "status": {
+                "state": state,
+                "since": self.state_since,
+                "rounds": self.rounds,
+                "last_respawn": self.last_respawn,
+                "proxy": self.proxy["host"] if self.proxy else None,
+                "name": self.nickname,
+                "updated": now,
+            }})
+        except Exception:
+            pass
 
     def dismiss_overlays_and_consent(self, page, humanizer: Optional[Humanizer] = None):
         """Decline GDPR consent banners (InMobi "We value your privacy", Google Funding Choices)."""
@@ -347,6 +380,7 @@ class PowerlineBot:
 
     def open_game(self, page):
         """Load the room and wait for the nickname lobby, so the bot never starts a game before typing its name."""
+        self.set_state("loading")
         logger.info(f"{self.log_prefix} Navigating to {self.target_url} ...")
         try:
             page.goto(self.target_url, wait_until="domcontentloaded", timeout=45000)
@@ -378,6 +412,7 @@ class PowerlineBot:
     def respawn(self, page, died_at: float):
         """Wait a sampled delay on the death screen, then play again."""
         delay = sample_respawn_delay()
+        self.set_state("dead")
         logger.info(f"{self.log_prefix} Death screen, respawn delay {delay:.1f}s...")
         self.debug_shot(page, "death")
         wait = died_at + delay - time.time()
@@ -390,7 +425,8 @@ class PowerlineBot:
             self.humanizer.press_key("Enter")
             self.humanizer.sleep(0.35, 0.05, 0.08, min_floor=0.25)
             if not self.is_out_of_game(page):
-                logger.info(f"{self.log_prefix} Respawned {time.time() - died_at:.1f}s after death.")
+                self.last_respawn = time.time() - died_at
+                logger.info(f"{self.log_prefix} Respawned {self.last_respawn:.1f}s after death.")
                 return
             if time.time() > give_up:
                 return  # Leave it to the outer loop (lobby, kicked, ...)
@@ -443,7 +479,7 @@ class PowerlineBot:
         else:
             logger.info(f"{self.log_prefix} Starting Camoufox without proxy as '{self.nickname}' | Headless={self.headless}")
 
-        rounds_played = 0
+        self.rounds = 0
         self.reached_game = False  # Whether this proxy ever got past "Connecting..."
         failed_reloads = 0         # Stuck reloads in a row that never reached the lobby or game
         seen_game = False          # Lobby, death screen or game seen since the last stuck reload
@@ -510,8 +546,9 @@ class PowerlineBot:
                     died_at = None
                 elif nick_visible:
                     died_at = None
+                    self.set_state("lobby")
                     h.sleep(0.8, 0.12, 0.2, min_floor=0.4)
-                    logger.info(f"{self.log_prefix} Spawning round #{rounds_played + 1} as '{self.nickname}'")
+                    logger.info(f"{self.log_prefix} Spawning round #{self.rounds + 1} as '{self.nickname}'")
                     h.click_locator(nick_input.first)
                     h.sleep(0.25, 0.04, 0.06, min_floor=0.15)
                     # The name is typed once; afterwards the field normally still holds it.
@@ -533,6 +570,8 @@ class PowerlineBot:
 
                 # Only steer once the lobby/death screens are gone; otherwise manage watchdog & drift.
                 if self.is_out_of_game(page):
+                    if not (death_visible or nick_visible):
+                        self.set_state("connecting")
                     # Stuck State Watchdog: prevent infinite loops when trapped in lobby
                     if h.check_watchdog(is_stuck=True, max_iterations=60, max_seconds=30.0):
                         logger.warning(
@@ -579,6 +618,7 @@ class PowerlineBot:
                 last_turn = time.time()
 
                 logger.info(f"{self.log_prefix} In game! Steering snake (Down/Left biased)...")
+                self.set_state("playing", force=True)
                 self.debug_shot(page, "ingame")
                 next_heartbeat = time.time() + 30
                 ticks, slowest_tick, last_tick = 0, 0.0, time.time()
@@ -594,10 +634,11 @@ class PowerlineBot:
                         self.debug_shot(page, "ingame")
                         next_heartbeat += 30
                         ticks, slowest_tick = 0, 0.0
+                    self.set_state("playing")
                     if self.poll_proxy_update():
                         break  # Leave the round; the outer loop reloads on the new IP
                     if self.is_out_of_game(page):
-                        rounds_played += 1
+                        self.rounds += 1
                         died_at = time.time()
                         logger.info(f"{self.log_prefix} Round ended after {time.time() - round_start:.1f}s.")
                         # Handle the death screen right away, so the respawn delay isn't eaten by the
@@ -618,6 +659,7 @@ class PowerlineBot:
                         next_heartbeat = time.time() + 30
                         ticks, slowest_tick, last_tick = 0, 0.0, time.time()
                         logger.info(f"{self.log_prefix} In game! Steering snake (Down/Left biased)...")
+                        self.set_state("playing", force=True)
                         continue
 
                     now = time.time()
@@ -739,6 +781,7 @@ def bot_worker_process(
             nickname=nickname,
             proxy_updates=proxy_updates,
             debug_dir=debug_dir,
+            reports=reports,
         )
         exit_code = bot.run()
         if exit_code == BAD_PROXY_EXIT and reports is not None:

@@ -72,10 +72,21 @@ python3 agent.py --coordinator 192.168.1.96 --headless
 
 If the connection drops, an agent stops its bots and reconnects every 5s, so either side can be restarted at any time. A bot that keeps failing waits longer before each restart (up to 60s), and proxy failures make the coordinator re-read Webshare's list right away, since they usually mean Webshare just rotated its IPs.
 
+## Dashboard
+
+The coordinator can serve a password-protected web page showing every bot (state: loading / connecting / lobby / playing / dead, machine, group, IP, rounds, last respawn time), every machine (CPU, RAM, bots), the proxies and a countdown to Webshare's next IP rotation, plus a feed of recent events. From it you can stop, start or restart a bot, stop or start all bots, pause a machine (its bots move elsewhere) or resume it, set a machine's bot limit, change the number of groups, and refresh the proxy list.
+
+```bash
+export POWERLINE_DASHBOARD_PASSWORD=choose-a-password
+python3 coordinator.py --listen 0.0.0.0 --dashboard 0.0.0.0 --headless   # then open http://<coordinator>:4042
+```
+
+Log in with any user name and that password. Keep port 4042 inside your network (don't forward it on the router).
+
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests
 ```
 
-They cover the pure logic (steering, nicknames, proxy reassignment, agent placement and rebalancing, restart backoff, respawn delays, click sampling), the agent and the coordinator-agent protocol over localhost, using fake workers, so they need no browser or internet.
+They cover the pure logic (steering, nicknames, proxy reassignment, agent placement and rebalancing, restart backoff, respawn delays, click sampling), the agent, the coordinator-agent protocol and the dashboard (server and commands) over localhost, using fake workers, so they need no browser or internet.

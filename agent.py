@@ -82,6 +82,7 @@ class Agent:
         self.workers: Dict[int, Tuple[multiprocessing.Process, "multiprocessing.Queue"]] = {}
         self.reports = multiprocessing.Queue()  # Workers say which proxy failed before exiting
         self.failed_proxies: Dict[int, Dict[str, str]] = {}  # Reports waiting for their worker's exit
+        self.bot_status: Dict[int, dict] = {}  # Latest status each bot reported (for the dashboard)
         if debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
         psutil.cpu_percent()  # Prime the counter; the first reading is always 0
@@ -115,6 +116,8 @@ class Agent:
     def stop_bots(self, bot_ids: List[int]):
         """Stop bots and every browser process they started, with one shared deadline."""
         items = [(i, *self.workers.pop(i)) for i in bot_ids if i in self.workers]
+        for i, _, _ in items:
+            self.bot_status.pop(i, None)
         # Record each worker's browser processes first: once a worker is killed, Windows has no
         # process group to find them by.
         trees = {i: process_tree(p.pid) for i, p, _ in items}
@@ -147,18 +150,14 @@ class Agent:
     def poll(self) -> List[dict]:
         """Report workers that exited on their own since the last call, and clean up after them.
         For a bad-proxy exit, "proxy" is the proxy the worker was actually using."""
-        while True:
-            try:
-                report = self.reports.get_nowait()
-            except queue.Empty:
-                break
-            self.failed_proxies[report["bot"]] = report["bad_proxy"]
+        self._drain_reports()
         events = []
         for bot_id, (p, _) in list(self.workers.items()):
             if p.is_alive():
                 continue
             del self.workers[bot_id]
             self._clean_up(bot_id, p, [])
+            self.bot_status.pop(bot_id, None)
             if p.exitcode == BAD_PROXY_EXIT and bot_id not in self.failed_proxies:
                 # The report can trail the exit by a moment.
                 deadline = time.time() + 1
@@ -167,7 +166,7 @@ class Agent:
                         report = self.reports.get(timeout=max(0.01, deadline - time.time()))
                     except queue.Empty:
                         break
-                    self.failed_proxies[report["bot"]] = report["bad_proxy"]
+                    self._file_report(report)
             events.append({
                 "type": "exited",
                 "bot": bot_id,
@@ -177,8 +176,23 @@ class Agent:
             })
         return events
 
+    def _file_report(self, report: dict):
+        if "bad_proxy" in report:
+            self.failed_proxies[report["bot"]] = report["bad_proxy"]
+        elif "status" in report and report["bot"] in self.workers:
+            self.bot_status[report["bot"]] = report["status"]
+
+    def _drain_reports(self):
+        while True:
+            try:
+                report = self.reports.get_nowait()
+            except queue.Empty:
+                return
+            self._file_report(report)
+
     def health(self) -> dict:
-        """A snapshot for the coordinator's placement decisions."""
+        """A snapshot for the coordinator's placement decisions and dashboard."""
+        self._drain_reports()
         mem = psutil.virtual_memory()
         return {
             "agent": self.name,
@@ -187,6 +201,9 @@ class Agent:
             "mem_available_mb": mem.available // (1024 * 1024),
             "bots": sorted(self.workers),
             "max_bots": self.max_bots,
+            "mem_total_mb": mem.total // (1024 * 1024),
+            "platform": platform.system(),
+            "bot_status": {str(b): st for b, st in self.bot_status.items()},
         }
 
     def handle(self, msg: dict):
@@ -199,6 +216,8 @@ class Agent:
             self.stop_bots(msg["bots"])
         elif msg["type"] == "stop_all":
             self.stop_all()
+        elif msg["type"] == "set_max_bots":
+            self.max_bots = msg["max_bots"]
         elif msg["type"] == "rejected":
             logger.error(f"[Agent {self.name}] Coordinator refused this agent: {msg['reason']}")
             sys.exit(1)
