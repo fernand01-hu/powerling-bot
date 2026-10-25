@@ -5,7 +5,7 @@ Powerline.io Autonomous Bot (Camoufox C++ Engine + EzSolver)
 Features:
 1. Camoufox C++ Anti-Detect Browser:
    - Firefox C++ engine level spoofing without detectable CDP hooks.
-   - Native humanize=True with stochastic Bézier mouse curves.
+   - Mouse, keyboard and timing input go through humanizer.py (Camoufox's own humanize is off).
    - Isolated HOME per worker process to eliminate Firefox bookmarks/places.sqlite locks.
 2. Directional Bias:
    - Primarily moves Down and Left (90%+), with rare Up and Right maneuvers.
@@ -16,7 +16,8 @@ Features:
    - Gradual staggered connection intervals so bots in a group connect one by one.
 4. Rotating Duty Cycle (2 Min Active / 1 Min Resting per group):
    - Each group plays for 2 minutes, then closes its browsers for 1 minute.
-   - Groups are offset by one rest period, so 2 groups play while 1 rests.
+   - Groups are spread evenly over the cycle (offset = cycle / groups); with the defaults
+     2 groups play while 1 rests.
 5. Cloudflare Turnstile & GDPR:
    - EzSolver integration for Turnstile checkbox targeting (x + 28, y + h / 2).
    - Automatic consent dismissal and room reconnect handling.
@@ -37,8 +38,10 @@ import time
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 from camoufox.pkgman import launch_path
 from camoufox.sync_api import Camoufox
+from humanizer import Humanizer
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -56,6 +59,8 @@ DEFAULT_STAGGER_INTERVAL = 3.0  # Seconds between each bot in a group connecting
 DEFAULT_ACTIVE_DURATION = 120   # 2 minutes active per group
 DEFAULT_PAUSE_DURATION = 60     # 1 minute resting per group
 MIN_USEFUL_WINDOW = 20          # Don't (re)start bots with less active time than this
+WINDOW_SIZE = (720, 480)        # Browser window size
+MIN_HOLD = 0.28                 # Shortest time a direction is held
 
 # Consent banner "decline" buttons: InMobi Choice ("DISAGREE") and Google Funding Choices ("Do not consent").
 CONSENT_DECLINE_PATTERN = re.compile(r"^\s*(disagree|reject all|do not consent)\s*$", re.IGNORECASE)
@@ -101,7 +106,9 @@ def pick_next_direction(current_dir: Optional[str]) -> Tuple[str, float]:
     Probabilities:
     - Down & Left: ~90% preference.
     - Up & Right: ~10% rare recovery moves.
-    - Up & Right are held for much shorter times (0.3s - 0.6s) to quickly return Down/Left.
+    - The first move (no current direction) is a 50/50 pick between Down and Left.
+    - Down & Left are held for 0.9s - 2.8s; Up & Right for only 0.28s - 0.65s to quickly return Down/Left.
+    - Durations sampled from right-skewed (normal + exponential) distributions rather than flat uniform.
     - Reversing 180 degrees into self is strictly avoided.
     """
     if current_dir in ("ArrowDown", "ArrowUp"):
@@ -117,9 +124,9 @@ def pick_next_direction(current_dir: Optional[str]) -> Tuple[str, float]:
     chosen = random.choices(ortho, weights=weights, k=1)[0]
 
     if chosen in ("ArrowDown", "ArrowLeft"):
-        duration = random.uniform(1.0, 2.5)
+        duration = float(np.clip(np.random.normal(1.6, 0.25) + np.random.exponential(0.2), 0.9, 2.8))
     else:
-        duration = random.uniform(0.3, 0.6)
+        duration = float(np.clip(np.random.normal(0.38, 0.05) + np.random.exponential(0.06), MIN_HOLD, 0.65))
 
     return chosen, duration
 
@@ -180,8 +187,14 @@ class EzSolver:
     """
 
     @staticmethod
-    def solve(page, log_prefix: str = "[EzSolver]", timeout: float = 12.0) -> bool:
+    def solve(
+        page,
+        log_prefix: str = "[EzSolver]",
+        timeout: float = 12.0,
+        humanizer: Optional[Humanizer] = None,
+    ) -> bool:
         start_time = time.time()
+        h = humanizer or Humanizer(page=page)
 
         while time.time() - start_time < timeout:
             token = page.evaluate("""
@@ -196,9 +209,9 @@ class EzSolver:
 
             captcha_retry = page.locator("#captchaTryAgainButton")
             if captcha_retry.count() > 0 and captcha_retry.first.is_visible():
-                logger.info(f"{log_prefix} Captcha retry button detected, clicking...")
-                captcha_retry.first.click()
-                time.sleep(1.5)
+                logger.info(f"{log_prefix} Captcha retry button detected, clicking with biometric profile...")
+                h.click_locator(captcha_retry.first)
+                h.sleep(1.2, 0.15, 0.2, min_floor=0.8)
 
             iframe_rect = page.evaluate("""
                 (() => {
@@ -232,16 +245,19 @@ class EzSolver:
             """)
 
             if iframe_rect:
-                cx = iframe_rect["x"] + 28 + random.uniform(-2, 2)
-                cy = iframe_rect["y"] + (iframe_rect["h"] / 2) + random.uniform(-2, 2)
-                logger.info(f"{log_prefix} Clicking Turnstile checkbox at ({cx:.1f}, {cy:.1f})")
+                # 2D Gaussian targeting centered on the Turnstile checkbox (~28px from left edge)
+                raw_cx = iframe_rect["x"] + 28.0 + float(np.random.normal(0.0, 1.8))
+                raw_cy = iframe_rect["y"] + (iframe_rect["h"] / 2.0) + float(np.random.normal(0.0, 1.8))
+                # Clamp safely within the 26x26 checkbox boundaries
+                cx = float(np.clip(raw_cx, iframe_rect["x"] + 22.0, iframe_rect["x"] + 34.0))
+                cy = float(np.clip(raw_cy, iframe_rect["y"] + (iframe_rect["h"] / 2.0) - 6.0, iframe_rect["y"] + (iframe_rect["h"] / 2.0) + 6.0))
+                logger.info(f"{log_prefix} Clicking Turnstile checkbox with WindMouse trajectory at ({cx:.1f}, {cy:.1f})")
 
-                page.mouse.move(cx - random.uniform(40, 80), cy - random.uniform(10, 30))
-                time.sleep(random.uniform(0.15, 0.3))
-                page.mouse.move(cx, cy)
-                time.sleep(random.uniform(0.1, 0.2))
-                page.mouse.click(cx, cy)
-                time.sleep(2.0)
+                # WindMouse move, then split down/up with physical contact hold duration
+                h.click_coords(cx, cy, enable_overshoot=True)
+
+                # Ambient idle drift while awaiting Turnstile verification
+                h.idle_drift(duration=1.4)
 
                 token_after = page.evaluate("""
                     (() => {
@@ -257,7 +273,7 @@ class EzSolver:
             if PowerlineBot.is_out_of_game(page):
                 return True
 
-            time.sleep(0.8)
+            h.sleep(0.65, 0.08, 0.12, min_floor=0.35)
 
         return False
 
@@ -283,18 +299,20 @@ class PowerlineBot:
         self.headless = headless
         self.session_duration = session_duration
         self.target_url = f"https://powerline.io/#{self.room}"
+        self.humanizer: Optional[Humanizer] = None
 
-    def dismiss_overlays_and_consent(self, page):
+    def dismiss_overlays_and_consent(self, page, humanizer: Optional[Humanizer] = None):
         """Decline GDPR consent banners (InMobi "We value your privacy", Google Funding Choices)."""
+        h = humanizer or self.humanizer or Humanizer(page=page)
         # Matched by button text so it keeps working if the CMP's markup changes; the banner
         # can be in the page itself or inside a CMP iframe, so check every frame.
         for frame in page.frames:
             try:
                 decline_btn = frame.get_by_role("button", name=CONSENT_DECLINE_PATTERN)
                 if decline_btn.count() > 0 and decline_btn.first.is_visible():
-                    logger.info(f"{self.log_prefix} Declining GDPR consent banner...")
-                    decline_btn.first.click()
-                    time.sleep(0.8)
+                    logger.info(f"{self.log_prefix} Declining GDPR consent banner with biometric click...")
+                    h.click_locator(decline_btn.first)
+                    h.sleep(0.7, 0.08, 0.12, min_floor=0.35)
                     break
             except Exception:
                 pass
@@ -304,8 +322,8 @@ class PowerlineBot:
             reconnect_btn = page.locator("#reconnectButton")
             if reconnect_btn.count() > 0 and reconnect_btn.first.is_visible():
                 logger.info(f"{self.log_prefix} Room timeout detected, clicking #reconnectButton...")
-                reconnect_btn.first.click()
-                time.sleep(1.0)
+                h.click_locator(reconnect_btn.first)
+                h.sleep(0.9, 0.1, 0.15, min_floor=0.45)
         except Exception:
             pass
 
@@ -314,8 +332,8 @@ class PowerlineBot:
             continue_btn = page.locator("#continueButton")
             if continue_btn.count() > 0 and continue_btn.first.is_visible():
                 logger.info(f"{self.log_prefix} Room connection failed, clicking #continueButton...")
-                continue_btn.first.click()
-                time.sleep(1.0)
+                h.click_locator(continue_btn.first)
+                h.sleep(0.9, 0.1, 0.15, min_floor=0.45)
         except Exception:
             pass
 
@@ -332,7 +350,7 @@ class PowerlineBot:
             })()
         """)
 
-    def run_session(self, proxy_info: Optional[Dict[str, str]] = None, max_duration: int = 300):
+    def run_session(self, proxy_info: Optional[Dict[str, str]] = None, max_duration: int = DEFAULT_ACTIVE_DURATION):
         """Run a single browser session with the assigned proxy."""
         proxy_opt = None
         if proxy_info:
@@ -355,7 +373,7 @@ class PowerlineBot:
         # and isolated profile preferences to prevent places.sqlite lock conflicts
         with Camoufox(
             headless=self.headless,
-            humanize=True,
+            humanize=False,  # humanizer.py drives the mouse; Camoufox's would re-humanize every step
             geoip=True,
             disable_coop=True,
             i_know_what_im_doing=True,
@@ -366,55 +384,84 @@ class PowerlineBot:
                 "browser.bookmarks.restore_default_bookmarks": False,
                 "browser.shell.checkDefaultBrowser": False,
             },
-            window=(720, 480),
+            window=WINDOW_SIZE,
             proxy=proxy_opt,
         ) as browser:
             page = browser.new_page()
+            # Mouse coordinates are relative to the viewport, which is smaller than the window.
+            try:
+                viewport = tuple(page.evaluate("() => [window.innerWidth, window.innerHeight]"))
+            except Exception:
+                viewport = WINDOW_SIZE
+            self.humanizer = Humanizer(
+                page=page,
+                session_start=session_start,
+                window_size=viewport,
+                fatigue_horizon=max_duration,
+            )
             logger.info(f"{self.log_prefix} Navigating to {self.target_url} ...")
             try:
                 page.goto(self.target_url, wait_until="domcontentloaded", timeout=45000)
             except Exception as e:
                 logger.warning(f"{self.log_prefix} Navigation warning: {e}")
 
-            time.sleep(2.5 + random.uniform(1.5, 3.5))
+            # Natural post-navigation dwell with ambient drift
+            self.humanizer.sleep(2.5, 0.3, 0.5, min_floor=1.8)
+            self.humanizer.idle_drift(duration=0.8)
 
             while time.time() - session_start < max_duration:
                 # 1. Dismiss popups / consent
-                self.dismiss_overlays_and_consent(page)
+                self.dismiss_overlays_and_consent(page, humanizer=self.humanizer)
 
                 # 2. Check for Turnstile
-                EzSolver.solve(page, log_prefix=self.log_prefix, timeout=5.0)
+                EzSolver.solve(page, log_prefix=self.log_prefix, timeout=5.0, humanizer=self.humanizer)
 
                 # 3. Check current page state (In lobby, Dead, In game)
                 death_btn = page.locator("#deathPlayAgain")
                 nick_input = page.locator("#nick")
 
                 if death_btn.count() > 0 and death_btn.first.is_visible():
-                    logger.info(f"{self.log_prefix} Death screen detected, brief pause before respawn...")
-                    time.sleep(random.uniform(1.2, 2.5))
-                    death_btn.first.click()
-                    time.sleep(1.0)
+                    logger.info(f"{self.log_prefix} Death screen detected, cognitive pause before respawn...")
+                    self.humanizer.sleep(1.4, 0.2, 0.3, min_floor=0.8)
+                    self.humanizer.click_locator(death_btn.first)
+                    self.humanizer.sleep(0.8, 0.1, 0.15, min_floor=0.4)
                 elif nick_input.count() > 0 and nick_input.first.is_visible():
-                    time.sleep(random.uniform(0.6, 1.6))
+                    self.humanizer.sleep(0.8, 0.12, 0.2, min_floor=0.4)
                     nickname = generate_random_nickname()
                     logger.info(f"{self.log_prefix} Spawning round #{rounds_played + 1} with nickname: '{nickname}'")
-                    nick_input.first.click()
-                    time.sleep(0.3)
+                    self.humanizer.click_locator(nick_input.first)
+                    self.humanizer.sleep(0.25, 0.04, 0.06, min_floor=0.15)
                     nick_input.first.fill("")
-                    for char in nickname:
-                        page.keyboard.type(char)
-                        time.sleep(random.uniform(0.04, 0.10))
-                    time.sleep(random.uniform(0.4, 0.8))
-                    page.keyboard.press("Enter")
-                    time.sleep(1.2)
+                    self.humanizer.sleep(0.15, 0.03, 0.05, min_floor=0.10)
+                    self.humanizer.type_text(nickname, typo_prob=0.04)
+                    self.humanizer.sleep(0.45, 0.08, 0.12, min_floor=0.25)
+                    self.humanizer.press_key("Enter")
+                    self.humanizer.sleep(1.0, 0.15, 0.2, min_floor=0.6)
                 else:
-                    page.keyboard.press("Enter")
-                    time.sleep(0.8)
+                    self.humanizer.press_key("Enter", hesitation=True)
+                    self.humanizer.sleep(0.7, 0.1, 0.15, min_floor=0.35)
 
-                # Only steer once the lobby/death screens are gone; otherwise re-check state.
+                # Only steer once the lobby/death screens are gone; otherwise manage watchdog & drift.
                 if self.is_out_of_game(page):
-                    time.sleep(1.0)
+                    # Stuck State Watchdog: prevent infinite loops when trapped in lobby
+                    if self.humanizer.check_watchdog(is_stuck=True, max_iterations=15, max_seconds=30.0):
+                        logger.warning(
+                            f"{self.log_prefix} Stuck state watchdog triggered (trapped out-of-game). Attempting page reload..."
+                        )
+                        try:
+                            page.reload(wait_until="domcontentloaded", timeout=15000)
+                            self.humanizer.reset_watchdog()
+                            self.humanizer.sleep(2.0, 0.3, 0.4, min_floor=1.0)
+                        except Exception as e:
+                            logger.warning(f"{self.log_prefix} Page reload failed ({e}); recycling session.")
+                            break
+                        continue
+
+                    self.humanizer.idle_drift(duration=0.6)
+                    self.humanizer.sleep(0.7, 0.1, 0.15, min_floor=0.4)
                     continue
+                else:
+                    self.humanizer.check_watchdog(is_stuck=False)
 
                 # 4. Gameplay loop for this round
                 round_start = time.time()
@@ -422,7 +469,7 @@ class PowerlineBot:
                 alive = True
 
                 next_dir, hold_time = pick_next_direction(current_dir)
-                page.keyboard.press(next_dir)
+                self.humanizer.press_key(next_dir, hesitation=True)
                 current_dir = next_dir
                 last_turn = time.time()
 
@@ -432,17 +479,22 @@ class PowerlineBot:
                         alive = False
                         rounds_played += 1
                         logger.info(f"{self.log_prefix} Round ended after {time.time() - round_start:.1f}s.")
-                        time.sleep(1.5)
+                        self.humanizer.sleep(1.2, 0.15, 0.25, min_floor=0.8)
                         break
 
                     now = time.time()
                     if now - last_turn > hold_time:
-                        chosen_dir, hold_time = pick_next_direction(current_dir)
-                        page.keyboard.press(chosen_dir)
+                        chosen_dir, next_hold = pick_next_direction(current_dir)
+                        # Biometric key press with human contact duration and micro-hesitation
+                        self.humanizer.press_key(chosen_dir, hesitation=True)
                         current_dir = chosen_dir
-                        last_turn = now
+                        # Add organic reaction jitter to next turn interval
+                        reaction_jitter = float(np.random.normal(0.0, 0.08))
+                        hold_time = max(MIN_HOLD, next_hold + reaction_jitter)
+                        last_turn = time.time()
 
-                    time.sleep(0.15)
+                    # Variable tick interval with Ex-Gaussian jitter instead of rigid 0.15s
+                    self.humanizer.sleep(mean=0.13, sigma=0.015, tau=0.02, min_floor=0.11)
 
             logger.info(f"{self.log_prefix} Session finished ({max_duration}s). Rounds played: {rounds_played}.")
 
@@ -483,6 +535,11 @@ def bot_worker_process(
     parent = multiprocessing.parent_process()
     if parent is not None and os.getppid() != parent.pid:
         sys.exit(0)  # Manager already gone before prctl took effect
+
+    # Re-seed RNG per worker process to guarantee independent stochastic biometrics
+    worker_seed = (os.getpid() ^ int(time.time() * 1000) ^ (instance_id << 16)) & 0xFFFFFFFF
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
     # Ensure fully isolated HOME directory per worker instance to completely prevent places.sqlite lock contention
     worker_home = f"/tmp/camoufox_worker_{instance_id}"
@@ -609,7 +666,8 @@ def main():
         for k in range(args.bots_per_proxy):
             i = g * args.bots_per_proxy + k
             start_delay = (k * args.stagger_interval) + random.uniform(1.0, 3.5)
-            p = spawn_worker(i, int(duration), start_delay)
+            # The session clock starts after the delay, so end it with the group's window.
+            p = spawn_worker(i, max(1, int(duration - start_delay)), start_delay)
             groups[g].append(p)
             logger.info(f"[Manager] Initialized worker #{i} (PID: {p.pid})")
 
@@ -661,7 +719,8 @@ def main():
                     if not p.is_alive():
                         i = g * args.bots_per_proxy + k
                         logger.warning(f"[Manager] Worker #{i} exited unexpectedly (code {p.exitcode}). Respawning...")
-                        groups[g][k] = spawn_worker(i, int(left), random.uniform(1.0, 3.5))
+                        start_delay = random.uniform(1.0, 3.5)
+                        groups[g][k] = spawn_worker(i, max(1, int(left - start_delay)), start_delay)
 
         time.sleep(1)
 
