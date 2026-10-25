@@ -14,7 +14,7 @@ Features:
    - Probabilistic overshooting (15-25% chance on moves over 90px) with corrective submovements.
    - Smooth multi-point trajectory dispatching every 7-12ms (~85-140Hz).
 2. Temporal Distribution Module:
-   - Right-skewed reaction time distributions modeled via Ex-Gaussian (scipy.stats.exponnorm).
+   - Right-skewed reaction time distributions modeled via Ex-Gaussian (normal + exponential).
    - Hard physiological neural clamp (floor >= 110-140ms for cognitive reaction tasks).
    - Split key & click contact durations (normally distributed contact 65ms-135ms).
    - Session fatigue: latency and variance ramp up linearly over the session (up to 1.25x).
@@ -39,7 +39,6 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import scipy.stats as stats
 
 logger = logging.getLogger("PowerlineBot.Humanizer")
 
@@ -137,13 +136,7 @@ def sample_ex_gaussian(
     eff_sigma = sigma * math.sqrt(fatigue_scale)
     eff_tau = tau * fatigue_scale
 
-    if eff_sigma > 1e-5 and eff_tau > 1e-5:
-        # scipy.stats.exponnorm parameterization: K = tau / sigma, loc = mean, scale = sigma
-        K = eff_tau / eff_sigma
-        val = float(stats.exponnorm.rvs(K, loc=eff_mean, scale=eff_sigma))
-    else:
-        val = float(np.random.normal(eff_mean, max(1e-4, eff_sigma)) + np.random.exponential(max(1e-4, eff_tau)))
-
+    val = float(np.random.normal(eff_mean, max(1e-4, eff_sigma)) + np.random.exponential(max(1e-4, eff_tau)))
     return max(min_floor, val)
 
 

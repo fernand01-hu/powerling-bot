@@ -14,10 +14,12 @@ Features:
 3. Proxy Groups:
    - Bots are split into groups (default 3 groups x 3 bots); each group shares one proxy IP.
    - Gradual staggered connection intervals so bots in a group connect one by one.
-4. Rotating Duty Cycle (2 Min Active / 1 Min Resting per group):
-   - Each group plays for 2 minutes, then closes its browsers for 1 minute.
-   - Groups are spread evenly over the cycle (offset = cycle / groups); with the defaults
-     2 groups play while 1 rests.
+4. Always-On Browsers:
+   - Every bot's browser stays open for the whole run; crashed workers are restarted.
+   - When Webshare rotates a group's proxy IP, its bots reload the game on the new IP.
+   - Each bot keeps one nickname for the whole run and respawns after a short,
+     right-skewed delay (usually under 2s, occasionally up to 15s). The game ignores
+     input for ~2s after a death, so most respawns land at ~2.5s.
 5. Cloudflare Turnstile & GDPR:
    - EzSolver integration for Turnstile checkbox targeting (x + 28, y + h / 2).
    - Automatic consent dismissal and room reconnect handling.
@@ -29,11 +31,13 @@ import json
 import logging
 import multiprocessing
 import os
+import queue
 import random
 import re
+import shutil
 import signal
-import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from typing import Dict, List, Optional, Tuple
@@ -56,9 +60,10 @@ DEFAULT_ROOM = "2cjg"
 DEFAULT_BOTS_PER_PROXY = 3
 DEFAULT_GROUPS = 3
 DEFAULT_STAGGER_INTERVAL = 3.0  # Seconds between each bot in a group connecting
-DEFAULT_ACTIVE_DURATION = 120   # 2 minutes active per group
-DEFAULT_PAUSE_DURATION = 60     # 1 minute resting per group
-MIN_USEFUL_WINDOW = 20          # Don't (re)start bots with less active time than this
+DEFAULT_PROXY_CHECK_INTERVAL = 60.0  # Seconds between Webshare checks for rotated IPs
+BAD_PROXY_EXIT = 3                   # Worker exit code: its proxy can't reach the game
+BAD_PROXY_COOLDOWN = 30 * 60         # Seconds a bad proxy is left out of the rotation
+MAX_FAILED_RELOADS = 2               # Stuck reloads in a row without reaching the game -> bad proxy
 WINDOW_SIZE = (720, 480)        # Browser window size
 MIN_HOLD = 0.28                 # Shortest time a direction is held
 
@@ -131,6 +136,48 @@ def pick_next_direction(current_dir: Optional[str]) -> Tuple[str, float]:
     return chosen, duration
 
 
+def sample_respawn_delay() -> float:
+    """Seconds between the death screen appearing and pressing respawn: usually under 2s,
+    occasionally a longer break of up to 15s."""
+    if random.random() < 0.85:
+        delay = np.random.normal(1.1, 0.25) + np.random.exponential(0.3)
+    else:
+        delay = 2.0 + np.random.exponential(3.5)
+    return float(np.clip(delay, 0.6, 15.0))
+
+
+def proxy_key(proxy: Dict[str, str]) -> Tuple[str, str]:
+    return proxy["host"], proxy["port"]
+
+
+def reassign_proxies(current: List[Optional[Dict[str, str]]], available: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Keep each group on its proxy while it's still available and not carrying more than its share
+    of groups; every other group moves to the least-used proxy, so groups stay spread out."""
+    by_key = {proxy_key(p): p for p in available}
+    share = -(-len(current) // len(available))  # Most groups any one proxy should carry (ceil)
+    load = {k: 0 for k in by_key}
+    result: List[Optional[Dict[str, str]]] = [None] * len(current)
+    for g, p in enumerate(current):
+        k = proxy_key(p) if p else None
+        if k in load and load[k] < share:
+            result[g] = by_key[k]
+            load[k] += 1
+    for g in range(len(result)):
+        if result[g] is None:
+            k = min(load, key=load.get)  # Ties go to the earliest proxy in Webshare's list
+            result[g] = by_key[k]
+            load[k] += 1
+    return result
+
+
+def to_playwright_proxy(proxy: Dict[str, str]) -> Dict[str, str]:
+    return {
+        "server": f"http://{proxy['host']}:{proxy['port']}",
+        "username": proxy["user"],
+        "password": proxy["pass"],
+    }
+
+
 # ============================================================================
 # 1. Webshare Proxy Manager
 # ============================================================================
@@ -140,18 +187,18 @@ class WebshareManager:
     def __init__(self, api_key: str = DEFAULT_WEBSHARE_API_KEY):
         self.api_key = api_key
         self.proxies: List[Dict[str, str]] = []
-        self.last_fetch_time = 0.0
 
     def fetch_proxies(self) -> List[Dict[str, str]]:
-        url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=25"
+        url: Optional[str] = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100"
         headers = {"Authorization": f"Token {self.api_key}"}
+        valid = []
         try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                results = data.get("results", [])
-                valid = []
-                for p in results:
+            # The list is paginated; follow "next" until every page is read.
+            while url:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                for p in data.get("results", []):
                     if p.get("valid", True):
                         valid.append({
                             "host": p["proxy_address"],
@@ -160,21 +207,14 @@ class WebshareManager:
                             "pass": p["password"],
                             "country": p.get("country_code", "XX"),
                         })
-                if valid:
-                    self.proxies = valid
-                    self.last_fetch_time = time.time()
-                    logger.info(f"[Webshare] Fetched {len(valid)} active proxies from API.")
-                return self.proxies
+                url = data.get("next")
         except Exception as e:
             logger.warning(f"[Webshare] Failed to fetch proxies: {e}")
             return self.proxies
-
-    def get_proxy_for_instance(self, instance_id: int, bots_per_proxy: int = DEFAULT_BOTS_PER_PROXY) -> Optional[Dict[str, str]]:
-        """Assign proxy so that `bots_per_proxy` instances share the same proxy."""
-        if not self.proxies:
-            return None
-        proxy_idx = (instance_id // max(1, bots_per_proxy)) % len(self.proxies)
-        return self.proxies[proxy_idx]
+        if valid:
+            self.proxies = valid
+            logger.info(f"[Webshare] Fetched {len(valid)} active proxies from API.")
+        return self.proxies
 
 
 # ============================================================================
@@ -197,6 +237,10 @@ class EzSolver:
         h = humanizer or Humanizer(page=page)
 
         while time.time() - start_time < timeout:
+            # Playing, lobby or death screen means the game is connected and no challenge is blocking it.
+            if PowerlineBot.is_connected(page):
+                return True
+
             token = page.evaluate("""
                 (() => {
                     const inp = document.querySelector('[name="cf-turnstile-response"]');
@@ -269,10 +313,6 @@ class EzSolver:
                     logger.info(f"{log_prefix} Turnstile challenge passed!")
                     return True
 
-            # Lobby or death screen visible means no challenge is blocking the game.
-            if PowerlineBot.is_out_of_game(page):
-                return True
-
             h.sleep(0.65, 0.08, 0.12, min_floor=0.35)
 
         return False
@@ -290,14 +330,19 @@ class PowerlineBot:
         room: str = DEFAULT_ROOM,
         proxy: Optional[Dict[str, str]] = None,
         headless: bool = False,
-        session_duration: int = DEFAULT_ACTIVE_DURATION,
+        nickname: Optional[str] = None,
+        proxy_updates: Optional["multiprocessing.Queue"] = None,
+        debug_dir: Optional[str] = None,
     ):
         self.instance_id = instance_id
         self.log_prefix = f"[Bot-{instance_id}]"
         self.room = room
         self.proxy = proxy
         self.headless = headless
-        self.session_duration = session_duration
+        self.nickname = nickname or generate_random_nickname()
+        self.proxy_updates = proxy_updates
+        self.pending_proxy: Optional[Dict[str, str]] = None
+        self.debug_dir = debug_dir
         self.target_url = f"https://powerline.io/#{self.room}"
         self.humanizer: Optional[Humanizer] = None
 
@@ -339,35 +384,134 @@ class PowerlineBot:
 
     @staticmethod
     def is_out_of_game(page) -> bool:
-        """True while the death screen or the nickname lobby is visible."""
+        """True while the game's menu overlay is up (lobby, Connecting..., death screen, kicked, server full).
+        The overlay is hidden only while actually playing."""
         return page.evaluate("""
             (() => {
-                const d = document.getElementById('deathPlayAgain');
-                const n = document.getElementById('nick');
-                const d_vis = !!d && d.offsetParent !== null;
-                const n_vis = !!n && n.offsetParent !== null;
-                return d_vis || n_vis;
+                const o = document.getElementById('overlay');
+                return !o || o.offsetParent !== null;
             })()
         """)
 
-    def run_session(self, proxy_info: Optional[Dict[str, str]] = None, max_duration: int = DEFAULT_ACTIVE_DURATION):
-        """Run a single browser session with the assigned proxy."""
-        proxy_opt = None
-        if proxy_info:
-            proxy_opt = {
-                "server": f"http://{proxy_info['host']}:{proxy_info['port']}",
-                "username": proxy_info["user"],
-                "password": proxy_info["pass"],
-            }
+    @staticmethod
+    def is_connected(page) -> bool:
+        """True while playing or on the lobby / death screen, i.e. not stuck connecting or blocked."""
+        return page.evaluate("""
+            (() => {
+                const vis = (id) => { const e = document.getElementById(id); return !!e && e.offsetParent !== null; };
+                return !vis('overlay') || vis('nick') || vis('deathPlayAgain');
+            })()
+        """)
+
+    def debug_shot(self, page, tag: str):
+        """Save a screenshot when --debug-dir is set, to check afterwards what the bot saw."""
+        if not self.debug_dir:
+            return
+        try:
+            path = os.path.join(self.debug_dir, f"bot{self.instance_id}_{time.strftime('%H%M%S')}_{tag}.png")
+            page.screenshot(path=path)
+        except Exception as e:
+            logger.warning(f"{self.log_prefix} Debug screenshot failed: {e}")
+
+    def open_game(self, page):
+        """Load the room and wait for the nickname lobby, so the bot never starts a game before typing its name."""
+        logger.info(f"{self.log_prefix} Navigating to {self.target_url} ...")
+        try:
+            page.goto(self.target_url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            logger.warning(f"{self.log_prefix} Navigation warning: {e}")
+        try:
+            page.wait_for_selector("#nick", state="visible", timeout=30000)
+        except Exception:
+            logger.warning(f"{self.log_prefix} Lobby didn't appear within 30s, continuing anyway.")
+        self.set_low_graphics(page)
+        self.debug_shot(page, "loaded")
+
+    def set_low_graphics(self, page):
+        """Switch the game to Low graphics: headless browsers render on the CPU, so this is what
+        decides how many bots one machine can run."""
+        try:
+            if page.evaluate("""
+                (() => {
+                    const b = document.getElementById('settingsGraphicsLow');
+                    if (!b) return false;
+                    b.click();
+                    return true;
+                })()
+            """):
+                logger.info(f"{self.log_prefix} Graphics set to Low.")
+        except Exception as e:
+            logger.warning(f"{self.log_prefix} Couldn't set Low graphics: {e}")
+
+    def respawn(self, page, died_at: float):
+        """Wait a sampled delay on the death screen, then play again."""
+        delay = sample_respawn_delay()
+        logger.info(f"{self.log_prefix} Death screen, respawn delay {delay:.1f}s...")
+        self.debug_shot(page, "death")
+        wait = died_at + delay - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        # The death panel slides in, so its small button can move under a click; the game also takes Enter.
+        # It ignores input while the death animation plays (~1.5-2s), so retry until it respawns.
+        give_up = time.time() + 6
+        while True:
+            self.humanizer.press_key("Enter")
+            self.humanizer.sleep(0.35, 0.05, 0.08, min_floor=0.25)
+            if not self.is_out_of_game(page):
+                logger.info(f"{self.log_prefix} Respawned {time.time() - died_at:.1f}s after death.")
+                return
+            if time.time() > give_up:
+                return  # Leave it to the outer loop (lobby, kicked, ...)
+
+    def poll_proxy_update(self) -> bool:
+        """Pick up the newest proxy sent by the manager; True if the bot should switch to it."""
+        if self.proxy_updates is None:
+            return False
+        try:
+            while True:
+                self.pending_proxy = self.proxy_updates.get_nowait()
+        except queue.Empty:
+            pass
+        return self.pending_proxy is not None
+
+    def switch_proxy(self, browser, page):
+        """Reload the game on the pending proxy IP without closing the browser.
+
+        A context's proxy is fixed when it's created, so the reload happens in a fresh
+        context on the new proxy, and the old one is closed.
+        """
+        proxy_info, self.pending_proxy = self.pending_proxy, None
+        logger.info(
+            f"{self.log_prefix} Proxy IP changed to {proxy_info['host']}:{proxy_info['port']} "
+            f"({proxy_info.get('country')}), refreshing the page..."
+        )
+        new_page = browser.new_page(proxy=to_playwright_proxy(proxy_info))
+        self.open_game(new_page)
+        try:
+            page.context.close()
+        except Exception:
+            pass
+        self.proxy = proxy_info
+        self.humanizer.page = new_page
+        self.humanizer.reset_watchdog()
+        self.humanizer.sleep(2.0, 0.3, 0.4, min_floor=1.2)
+        return new_page
+
+    def run_session(self) -> Optional[int]:
+        """Keep one browser open and play until terminated, following proxy IP changes."""
+        proxy_opt = to_playwright_proxy(self.proxy) if self.proxy else None
+        if self.proxy:
             logger.info(
-                f"{self.log_prefix} Starting Camoufox with proxy {proxy_info['host']}:{proxy_info['port']} "
-                f"({proxy_info.get('country')}) | Headless={self.headless}"
+                f"{self.log_prefix} Starting Camoufox with proxy {self.proxy['host']}:{self.proxy['port']} "
+                f"({self.proxy.get('country')}) as '{self.nickname}' | Headless={self.headless}"
             )
         else:
-            logger.info(f"{self.log_prefix} Starting Camoufox without proxy | Headless={self.headless}")
+            logger.info(f"{self.log_prefix} Starting Camoufox without proxy as '{self.nickname}' | Headless={self.headless}")
 
-        session_start = time.time()
         rounds_played = 0
+        self.reached_game = False  # Whether this proxy ever got past "Connecting..."
+        failed_reloads = 0         # Stuck reloads in a row that never reached the lobby or game
+        seen_game = False          # Lobby, death screen or game seen since the last stuck reload
 
         # Launch native Camoufox browser with C++ anti-detect engine
         # and isolated profile preferences to prevent places.sqlite lock conflicts
@@ -393,100 +537,156 @@ class PowerlineBot:
                 viewport = tuple(page.evaluate("() => [window.innerWidth, window.innerHeight]"))
             except Exception:
                 viewport = WINDOW_SIZE
-            self.humanizer = Humanizer(
-                page=page,
-                session_start=session_start,
-                window_size=viewport,
-                fatigue_horizon=max_duration,
-            )
-            logger.info(f"{self.log_prefix} Navigating to {self.target_url} ...")
-            try:
-                page.goto(self.target_url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as e:
-                logger.warning(f"{self.log_prefix} Navigation warning: {e}")
+            self.humanizer = Humanizer(page=page, window_size=viewport)
+            h = self.humanizer
+            self.open_game(page)
 
             # Natural post-navigation dwell with ambient drift
-            self.humanizer.sleep(2.5, 0.3, 0.5, min_floor=1.8)
-            self.humanizer.idle_drift(duration=0.8)
+            h.sleep(2.5, 0.3, 0.5, min_floor=1.8)
+            h.idle_drift(duration=0.8)
 
-            while time.time() - session_start < max_duration:
+            died_at: Optional[float] = None  # When the current death happened, if known
+
+            while True:
+                # 0. Follow a proxy IP change from the manager
+                if self.poll_proxy_update():
+                    page = self.switch_proxy(browser, page)
+                    died_at = None
+                    self.reached_game, failed_reloads, seen_game = False, 0, False
+
                 # 1. Dismiss popups / consent
-                self.dismiss_overlays_and_consent(page, humanizer=self.humanizer)
+                self.dismiss_overlays_and_consent(page, humanizer=h)
 
                 # 2. Check for Turnstile
-                EzSolver.solve(page, log_prefix=self.log_prefix, timeout=5.0, humanizer=self.humanizer)
+                EzSolver.solve(page, log_prefix=self.log_prefix, timeout=5.0, humanizer=h)
 
                 # 3. Check current page state (In lobby, Dead, In game)
                 death_btn = page.locator("#deathPlayAgain")
                 nick_input = page.locator("#nick")
 
-                if death_btn.count() > 0 and death_btn.first.is_visible():
-                    logger.info(f"{self.log_prefix} Death screen detected, cognitive pause before respawn...")
-                    self.humanizer.sleep(1.4, 0.2, 0.3, min_floor=0.8)
-                    self.humanizer.click_locator(death_btn.first)
-                    self.humanizer.sleep(0.8, 0.1, 0.15, min_floor=0.4)
-                elif nick_input.count() > 0 and nick_input.first.is_visible():
-                    self.humanizer.sleep(0.8, 0.12, 0.2, min_floor=0.4)
-                    nickname = generate_random_nickname()
-                    logger.info(f"{self.log_prefix} Spawning round #{rounds_played + 1} with nickname: '{nickname}'")
-                    self.humanizer.click_locator(nick_input.first)
-                    self.humanizer.sleep(0.25, 0.04, 0.06, min_floor=0.15)
-                    nick_input.first.fill("")
-                    self.humanizer.sleep(0.15, 0.03, 0.05, min_floor=0.10)
-                    self.humanizer.type_text(nickname, typo_prob=0.04)
-                    self.humanizer.sleep(0.45, 0.08, 0.12, min_floor=0.25)
-                    self.humanizer.press_key("Enter")
-                    self.humanizer.sleep(1.0, 0.15, 0.2, min_floor=0.6)
+                death_visible = death_btn.count() > 0 and death_btn.first.is_visible()
+                nick_visible = not death_visible and nick_input.count() > 0 and nick_input.first.is_visible()
+                if death_visible or nick_visible:
+                    self.reached_game = seen_game = True
+                    failed_reloads = 0
+
+                if death_visible:
+                    self.respawn(page, died_at or time.time())
+                    died_at = None
+                elif nick_visible:
+                    died_at = None
+                    h.sleep(0.8, 0.12, 0.2, min_floor=0.4)
+                    logger.info(f"{self.log_prefix} Spawning round #{rounds_played + 1} as '{self.nickname}'")
+                    h.click_locator(nick_input.first)
+                    h.sleep(0.25, 0.04, 0.06, min_floor=0.15)
+                    # The name is typed once; afterwards the field normally still holds it.
+                    try:
+                        current_name = nick_input.first.input_value()
+                    except Exception:
+                        current_name = ""
+                    if current_name != self.nickname:
+                        nick_input.first.fill("")
+                        h.sleep(0.15, 0.03, 0.05, min_floor=0.10)
+                        h.type_text(self.nickname, typo_prob=0.04)
+                        h.sleep(0.45, 0.08, 0.12, min_floor=0.25)
+                    self.debug_shot(page, "spawn")
+                    h.press_key("Enter")
+                    h.sleep(1.0, 0.15, 0.2, min_floor=0.6)
                 else:
-                    self.humanizer.press_key("Enter", hesitation=True)
-                    self.humanizer.sleep(0.7, 0.1, 0.15, min_floor=0.35)
+                    # In game or still loading: pressing Enter here could start a game without the name.
+                    h.sleep(0.3, 0.05, 0.08, min_floor=0.15)
 
                 # Only steer once the lobby/death screens are gone; otherwise manage watchdog & drift.
                 if self.is_out_of_game(page):
                     # Stuck State Watchdog: prevent infinite loops when trapped in lobby
-                    if self.humanizer.check_watchdog(is_stuck=True, max_iterations=15, max_seconds=30.0):
+                    if h.check_watchdog(is_stuck=True, max_iterations=60, max_seconds=30.0):
                         logger.warning(
                             f"{self.log_prefix} Stuck state watchdog triggered (trapped out-of-game). Attempting page reload..."
                         )
+                        self.debug_shot(page, "stuck")
+                        # A proxy that already got this bot into the game is only having a slow
+                        # moment (or the machine is overloaded); only one that never connected is bad.
+                        if not seen_game and not self.reached_game:
+                            failed_reloads += 1
+                            if failed_reloads >= MAX_FAILED_RELOADS:
+                                logger.warning(
+                                    f"{self.log_prefix} Proxy {self.proxy['host'] if self.proxy else 'direct'} "
+                                    f"never got past connecting; reporting it as bad."
+                                )
+                                return BAD_PROXY_EXIT
+                        seen_game = False
                         try:
                             page.reload(wait_until="domcontentloaded", timeout=15000)
-                            self.humanizer.reset_watchdog()
-                            self.humanizer.sleep(2.0, 0.3, 0.4, min_floor=1.0)
+                            h.reset_watchdog()
+                            h.sleep(2.0, 0.3, 0.4, min_floor=1.0)
                         except Exception as e:
-                            logger.warning(f"{self.log_prefix} Page reload failed ({e}); recycling session.")
-                            break
+                            logger.warning(f"{self.log_prefix} Page reload failed ({e}); restarting the browser.")
+                            return None
                         continue
 
-                    self.humanizer.idle_drift(duration=0.6)
-                    self.humanizer.sleep(0.7, 0.1, 0.15, min_floor=0.4)
+                    h.sleep(0.3, 0.05, 0.08, min_floor=0.15)
                     continue
                 else:
-                    self.humanizer.check_watchdog(is_stuck=False)
+                    h.check_watchdog(is_stuck=False)
+                    self.reached_game = seen_game = True
+                    failed_reloads = 0
 
                 # 4. Gameplay loop for this round
                 round_start = time.time()
                 current_dir = None
-                alive = True
 
                 next_dir, hold_time = pick_next_direction(current_dir)
-                self.humanizer.press_key(next_dir, hesitation=True)
+                h.press_key(next_dir, hesitation=True)
                 current_dir = next_dir
                 last_turn = time.time()
 
                 logger.info(f"{self.log_prefix} In game! Steering snake (Down/Left biased)...")
-                while alive and (time.time() - session_start < max_duration):
+                self.debug_shot(page, "ingame")
+                next_heartbeat = time.time() + 30
+                ticks, slowest_tick, last_tick = 0, 0.0, time.time()
+                while True:
+                    now = time.time()
+                    ticks, slowest_tick, last_tick = ticks + 1, max(slowest_tick, now - last_tick), now
+                    if now >= next_heartbeat:
+                        # Steering loop timing: ~150ms per tick is normal; much more means the machine is overloaded.
+                        logger.info(
+                            f"{self.log_prefix} Still in game ({now - round_start:.0f}s this round, "
+                            f"avg tick {30000 / max(1, ticks):.0f}ms, slowest {slowest_tick * 1000:.0f}ms)."
+                        )
+                        self.debug_shot(page, "ingame")
+                        next_heartbeat += 30
+                        ticks, slowest_tick = 0, 0.0
+                    if self.poll_proxy_update():
+                        break  # Leave the round; the outer loop reloads on the new IP
                     if self.is_out_of_game(page):
-                        alive = False
                         rounds_played += 1
+                        died_at = time.time()
                         logger.info(f"{self.log_prefix} Round ended after {time.time() - round_start:.1f}s.")
-                        self.humanizer.sleep(1.2, 0.15, 0.25, min_floor=0.8)
-                        break
+                        # Handle the death screen right away, so the respawn delay isn't eaten by the
+                        # consent/Turnstile checks at the top of the outer loop.
+                        try:
+                            page.locator("#deathPlayAgain:visible, #nick:visible").first.wait_for(timeout=3000)
+                        except Exception:
+                            break  # Not a normal death (kicked, disconnected...); the outer loop handles it
+                        if not page.locator("#deathPlayAgain").first.is_visible():
+                            break  # Back at the lobby; the outer loop spawns from there
+                        self.respawn(page, died_at)
+                        died_at = None
+                        if self.is_out_of_game(page):
+                            break  # Respawn didn't take; the outer loop sorts it out
+                        # Back in game: start the next round right here, turning on the next tick.
+                        round_start = time.time()
+                        current_dir, last_turn, hold_time = None, 0.0, 0.0
+                        next_heartbeat = time.time() + 30
+                        ticks, slowest_tick, last_tick = 0, 0.0, time.time()
+                        logger.info(f"{self.log_prefix} In game! Steering snake (Down/Left biased)...")
+                        continue
 
                     now = time.time()
                     if now - last_turn > hold_time:
                         chosen_dir, next_hold = pick_next_direction(current_dir)
                         # Biometric key press with human contact duration and micro-hesitation
-                        self.humanizer.press_key(chosen_dir, hesitation=True)
+                        h.press_key(chosen_dir, hesitation=True)
                         current_dir = chosen_dir
                         # Add organic reaction jitter to next turn interval
                         reaction_jitter = float(np.random.normal(0.0, 0.08))
@@ -494,18 +694,22 @@ class PowerlineBot:
                         last_turn = time.time()
 
                     # Variable tick interval with Ex-Gaussian jitter instead of rigid 0.15s
-                    self.humanizer.sleep(mean=0.13, sigma=0.015, tau=0.02, min_floor=0.11)
+                    h.sleep(mean=0.13, sigma=0.015, tau=0.02, min_floor=0.11)
 
-            logger.info(f"{self.log_prefix} Session finished ({max_duration}s). Rounds played: {rounds_played}.")
-
-    def run(self):
-        """Single-session execution for the scheduled active period."""
+    def run(self) -> Optional[int]:
+        """Run until terminated; an error ends the worker so the manager restarts it.
+        Returns BAD_PROXY_EXIT when the proxy never let the game connect."""
+        self.reached_game = False
         try:
-            self.run_session(proxy_info=self.proxy, max_duration=self.session_duration)
+            return self.run_session()
         except (KeyboardInterrupt, SystemExit):
             logger.info(f"{self.log_prefix} Terminated, closing browser.")
         except Exception as e:
             logger.error(f"{self.log_prefix} Session error: {e}", exc_info=True)
+            if not self.reached_game:
+                # Failed before ever reaching the game (e.g. the proxy refuses connections at launch).
+                return BAD_PROXY_EXIT
+        return None
 
 
 # ============================================================================
@@ -516,8 +720,11 @@ def bot_worker_process(
     room: str,
     proxy: Optional[Dict[str, str]],
     headless: bool,
-    session_duration: int,
     start_delay: float,
+    nickname: str,
+    proxy_updates: "multiprocessing.Queue",
+    debug_dir: Optional[str] = None,
+    worker_home: Optional[str] = None,
 ):
     """Entry point for each independent bot worker process with isolated profile and gradual connection."""
     # Forked workers inherit the manager's signal handlers; reset them so a worker never
@@ -542,22 +749,30 @@ def bot_worker_process(
     np.random.seed(worker_seed)
 
     # Ensure fully isolated HOME directory per worker instance to completely prevent places.sqlite lock contention
-    worker_home = f"/tmp/camoufox_worker_{instance_id}"
+    # Unique per worker process, so concurrent runs never share (or delete) each other's HOME.
+    worker_home = worker_home or tempfile.mkdtemp(prefix=f"camoufox_worker_{instance_id}_")
     os.makedirs(worker_home, exist_ok=True)
     os.environ["HOME"] = worker_home
 
-    if start_delay > 0:
-        logger.info(f"[Bot-{instance_id}] Waiting {start_delay:.1f}s before connecting (gradual join)...")
-        time.sleep(start_delay)
+    try:
+        if start_delay > 0:
+            logger.info(f"[Bot-{instance_id}] Waiting {start_delay:.1f}s before connecting (gradual join)...")
+            time.sleep(start_delay)
 
-    bot = PowerlineBot(
-        instance_id=instance_id,
-        room=room,
-        proxy=proxy,
-        headless=headless,
-        session_duration=session_duration,
-    )
-    bot.run()
+        bot = PowerlineBot(
+            instance_id=instance_id,
+            room=room,
+            proxy=proxy,
+            headless=headless,
+            nickname=nickname,
+            proxy_updates=proxy_updates,
+            debug_dir=debug_dir,
+        )
+        exit_code = bot.run()
+    finally:
+        shutil.rmtree(worker_home, ignore_errors=True)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 # ============================================================================
@@ -591,139 +806,151 @@ def main():
         help="Average seconds between each bot in a group connecting (default: 3.0)",
     )
     parser.add_argument(
-        "--active-duration",
-        type=int,
-        default=DEFAULT_ACTIVE_DURATION,
-        help="Seconds each group plays before resting (default: 120)",
+        "--proxy-check-interval",
+        type=float,
+        default=DEFAULT_PROXY_CHECK_INTERVAL,
+        help="Seconds between Webshare checks for rotated proxy IPs (default: 60)",
     )
     parser.add_argument(
-        "--pause-duration",
-        type=int,
-        default=DEFAULT_PAUSE_DURATION,
-        help="Seconds each group rests with its browsers closed (default: 60)",
+        "--debug-dir",
+        help="Save screenshots of key moments (load, spawn, death, every 30s in game) to this folder",
     )
     args = parser.parse_args()
 
     if not args.webshare_key:
         parser.error("no Webshare API key: set WEBSHARE_API_KEY or pass --webshare-key")
-    if args.groups < 1 or args.bots_per_proxy < 1 or args.active_duration < 1 or args.pause_duration < 0:
-        parser.error("--groups, --bots-per-proxy and --active-duration must be >= 1, --pause-duration >= 0")
+    if args.groups < 1 or args.bots_per_proxy < 1 or args.proxy_check_interval <= 0:
+        parser.error("--groups and --bots-per-proxy must be >= 1, --proxy-check-interval > 0")
 
     # Ensure DISPLAY is set for non-headless runs
     if not args.headless and not os.environ.get("DISPLAY"):
         os.environ["DISPLAY"] = ":0"
 
-    period = args.active_duration + args.pause_duration
-    offset = period / args.groups  # Groups are spread evenly over one cycle
+    total = args.groups * args.bots_per_proxy
+    if args.debug_dir:
+        os.makedirs(args.debug_dir, exist_ok=True)
 
     print("=" * 65)
-    print(" Powerline.io Autonomous Bot (Camoufox C++ Rotating Groups)")
+    print(" Powerline.io Autonomous Bot (Camoufox C++ Always-On Groups)")
     print(f" Room: #{args.room} | Groups: {args.groups} x {args.bots_per_proxy} bots (1 IP per group)")
-    print(f" Per group: {args.active_duration}s active / {args.pause_duration}s resting, offset {offset:.0f}s")
-    print(f" Stagger: {args.stagger_interval}s | Headless: {args.headless}")
+    print(f" Proxy check every {args.proxy_check_interval:.0f}s | Stagger: {args.stagger_interval}s | Headless: {args.headless}")
     print("=" * 65)
 
     proxy_mgr = WebshareManager(api_key=args.webshare_key)
-    groups: List[List[multiprocessing.Process]] = [[] for _ in range(args.groups)]
-    retry_at = [0.0] * args.groups
-    t0 = time.time()
+    while not proxy_mgr.fetch_proxies():
+        logger.error("[Manager] No proxies available from Webshare, retrying in 30s...")
+        time.sleep(30)
+    if len(proxy_mgr.proxies) < args.groups:
+        logger.warning(f"[Manager] Only {len(proxy_mgr.proxies)} proxies for {args.groups} groups; some groups share an IP.")
 
-    def window(g: int, now: float) -> Tuple[bool, float]:
-        """(is group g in its active window, seconds until its state flips)."""
-        pos = (now - t0 + g * offset) % period
-        if pos < args.active_duration:
-            return True, args.active_duration - pos
-        return False, period - pos
+    group_proxies: List[Dict[str, str]] = reassign_proxies([None] * args.groups, proxy_mgr.proxies)
+    # One name per bot for the whole run, kept across deaths and worker restarts.
+    nicknames = [generate_random_nickname() for _ in range(total)]
+    workers: List[Optional[multiprocessing.Process]] = [None] * total
+    update_queues: List[Optional[multiprocessing.Queue]] = [None] * total
 
-    def spawn_worker(i: int, session_duration: int, start_delay: float) -> multiprocessing.Process:
-        proxy = proxy_mgr.get_proxy_for_instance(i, args.bots_per_proxy)
+    def worker_home(i: int) -> str:
+        # Chosen here (unique per manager run) so the manager can delete it even if it has to kill the worker.
+        return os.path.join(tempfile.gettempdir(), f"camoufox_worker_{os.getpid()}_{i}")
+
+    def spawn_worker(i: int, start_delay: float):
+        # Fresh queue, so a restarted worker doesn't replay updates meant for the old one.
+        update_queues[i] = multiprocessing.Queue()
         p = multiprocessing.Process(
             target=bot_worker_process,
-            args=(i, args.room, proxy, args.headless, session_duration, start_delay),
+            args=(
+                i, args.room, group_proxies[i // args.bots_per_proxy], args.headless,
+                start_delay, nicknames[i], update_queues[i], args.debug_dir, worker_home(i),
+            ),
             name=f"PowerlineWorker-{i}",
         )
         p.daemon = True
         p.start()
-        return p
+        workers[i] = p
+        logger.info(f"[Manager] Started worker #{i} '{nicknames[i]}' (PID: {p.pid})")
 
-    def start_group(g: int, duration: float):
-        # Refresh the proxy list at most once per cycle, shared by every group.
-        if not proxy_mgr.proxies or time.time() - proxy_mgr.last_fetch_time > period:
-            proxy_mgr.fetch_proxies()
-        if not proxy_mgr.proxies:
-            logger.error(f"[Manager] No proxies available for group {g}, retrying in 30s...")
-            retry_at[g] = time.time() + 30
-            return
-        if len(proxy_mgr.proxies) < args.groups:
-            logger.warning(
-                f"[Manager] Only {len(proxy_mgr.proxies)} proxies for {args.groups} groups; some groups share an IP."
-            )
-        proxy = proxy_mgr.get_proxy_for_instance(g * args.bots_per_proxy, args.bots_per_proxy)
-        logger.info(
-            f"[Manager] Group {g} starting for {duration:.0f}s on {proxy['host']}:{proxy['port']} "
-            f"({args.bots_per_proxy} bots)"
-        )
-        for k in range(args.bots_per_proxy):
-            i = g * args.bots_per_proxy + k
-            start_delay = (k * args.stagger_interval) + random.uniform(1.0, 3.5)
-            # The session clock starts after the delay, so end it with the group's window.
-            p = spawn_worker(i, max(1, int(duration - start_delay)), start_delay)
-            groups[g].append(p)
-            logger.info(f"[Manager] Initialized worker #{i} (PID: {p.pid})")
+    def stop_worker(i: int, p: multiprocessing.Process, deadline: Optional[float] = None):
+        p.join(timeout=max(0.0, (deadline or time.time() + 5) - time.time()))
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=2)
+        # Each worker leads its own process group; kill whatever browser processes are left in it.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        shutil.rmtree(worker_home(i), ignore_errors=True)
 
-    def stop_group(g: int):
-        for p in groups[g]:
-            if p.is_alive():
-                p.terminate()
-        for p in groups[g]:
-            p.join(timeout=5)
-            if p.is_alive():
-                # Worker didn't unwind in time: kill it together with its browser.
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    p.kill()
-                p.join(timeout=2)
-        groups[g].clear()
+    bad_until: Dict[Tuple[str, str], float] = {}
+
+    def usable_proxies() -> List[Dict[str, str]]:
+        """Webshare's list minus proxies benched as bad; all of them if every one is benched."""
+        now = time.time()
+        usable = [p for p in proxy_mgr.proxies if bad_until.get(proxy_key(p), 0) <= now]
+        return usable or proxy_mgr.proxies
+
+    def apply_proxies():
+        nonlocal group_proxies
+        new = reassign_proxies(group_proxies, usable_proxies())
+        for g, (old, cur) in enumerate(zip(group_proxies, new)):
+            if proxy_key(old) != proxy_key(cur):
+                logger.info(
+                    f"[Manager] Group {g} IP rotated: {old['host']}:{old['port']} -> {cur['host']}:{cur['port']}"
+                )
+                for i in range(g * args.bots_per_proxy, (g + 1) * args.bots_per_proxy):
+                    if workers[i] is not None and workers[i].is_alive():
+                        update_queues[i].put(cur)
+        group_proxies = new
+
+    def check_proxies():
+        if proxy_mgr.fetch_proxies():
+            apply_proxies()
 
     def sigint_handler(sig, frame):
         logger.info("[Manager] Shutting down all worker processes...")
-        for g in range(args.groups):
-            stop_group(g)
-        # Ensure all browser instances close completely
-        try:
-            subprocess.run(["pkill", "-f", "camoufox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+        started = [(i, p) for i, p in enumerate(workers) if p is not None]
+        for _, p in started:
+            if p.is_alive():
+                p.terminate()
+        # One shared deadline, so shutting down many workers doesn't wait 5s for each in turn.
+        deadline = time.time() + 8
+        for i, p in started:
+            stop_worker(i, p, deadline)
         logger.info("[Manager] All workers stopped cleanly.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, sigint_handler)
     signal.signal(signal.SIGTERM, sigint_handler)
 
-    while True:
-        now = time.time()
-        for g in range(args.groups):
-            active, left = window(g, now)
-            running = bool(groups[g])
+    for g in range(args.groups):
+        proxy = group_proxies[g]
+        logger.info(f"[Manager] Group {g} on {proxy['host']}:{proxy['port']} ({args.bots_per_proxy} bots)")
+        for k in range(args.bots_per_proxy):
+            spawn_worker(g * args.bots_per_proxy + k, (k * args.stagger_interval) + random.uniform(1.0, 3.5))
 
-            if active and not running:
-                if left > MIN_USEFUL_WINDOW and now >= retry_at[g]:
-                    start_group(g, left)
-            elif not active and running:
-                logger.info(f"[Manager] Group {g} resting for {left:.0f}s, closing its browsers...")
-                stop_group(g)
-            elif active and running and left > MIN_USEFUL_WINDOW:
-                # Respawn crashed workers for the rest of the group's window
-                for k, p in enumerate(groups[g]):
-                    if not p.is_alive():
-                        i = g * args.bots_per_proxy + k
-                        logger.warning(f"[Manager] Worker #{i} exited unexpectedly (code {p.exitcode}). Respawning...")
-                        start_delay = random.uniform(1.0, 3.5)
-                        groups[g][k] = spawn_worker(i, max(1, int(left - start_delay)), start_delay)
+    next_proxy_check = time.time() + args.proxy_check_interval
+    while True:
+        if time.time() >= next_proxy_check:
+            check_proxies()
+            next_proxy_check = time.time() + args.proxy_check_interval
+
+        # Restart crashed workers on their group's current proxy, with the same name
+        for i, p in enumerate(workers):
+            if p is not None and not p.is_alive():
+                if p.exitcode == BAD_PROXY_EXIT:
+                    bad = group_proxies[i // args.bots_per_proxy]
+                    logger.warning(
+                        f"[Manager] Worker #{i} reports proxy {bad['host']}:{bad['port']} can't reach the game; "
+                        f"benching it for {BAD_PROXY_COOLDOWN // 60} min and moving its group."
+                    )
+                    bad_until[proxy_key(bad)] = time.time() + BAD_PROXY_COOLDOWN
+                    apply_proxies()
+                else:
+                    logger.warning(f"[Manager] Worker #{i} exited unexpectedly (code {p.exitcode}). Restarting...")
+                stop_worker(i, p)
+                spawn_worker(i, random.uniform(1.0, 3.5))
 
         time.sleep(1)
-
 
 if __name__ == "__main__":
     main()
