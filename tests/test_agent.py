@@ -21,6 +21,14 @@ def fake_steady_worker(bot_id, room, proxy, headless, start_delay, nickname, upd
         pass
 
 
+def fake_stubborn_worker(bot_id, room, proxy, headless, start_delay, nickname, updates, debug_dir, home, reports):
+    """A worker stuck somewhere it never reads its queue, and that ignores SIGTERM too."""
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True:
+        time.sleep(1)
+
+
 def proxy(host):
     return {"host": host, "port": "8080", "user": "u", "pass": "p", "country": "XX"}
 
@@ -56,6 +64,22 @@ class AgentTest(unittest.TestCase):
         agent.stop_all()
         self.assertEqual(agent.health()["bots"], [])
         self.assertEqual(agent.poll(), [])  # Stopped bots aren't reported as unexpected exits
+
+
+class StopTest(unittest.TestCase):
+    def test_stop_returns_at_once_and_clean_up_kills_stubborn_workers(self):
+        agent = Agent(name="test", worker_target=fake_stubborn_worker)
+        agent.start_bot(0, "room", proxy("a"), "Nick", 0)
+        time.sleep(0.5)
+        proc = agent.workers[0][0]
+        started = time.time()
+        agent.stop_bots([0])
+        self.assertLess(time.time() - started, 1.0)  # The caller (the coordinator's loop) isn't held up
+        self.assertEqual(agent.health()["bots"], [])
+        self.assertTrue(proc.is_alive())  # Still shutting down in the background
+        agent.finish_stopping(wait=True)  # What poll() does once the 8s deadline has passed
+        self.assertFalse(proc.is_alive())
+        self.assertEqual(agent.stopping, [])
 
 
 if __name__ == "__main__":

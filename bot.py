@@ -632,7 +632,7 @@ class PowerlineBot:
                             f"avg tick {30000 / max(1, ticks):.0f}ms, slowest {slowest_tick * 1000:.0f}ms)."
                         )
                         self.debug_shot(page, "ingame")
-                        next_heartbeat += 30
+                        next_heartbeat = now + 30  # Not += 30: after a stall (e.g. the machine slept) it would fire every tick to catch up
                         ticks, slowest_tick = 0, 0.0
                     self.set_state("playing")
                     if self.poll_proxy_update():

@@ -31,7 +31,9 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
-from agent import AGENT_KEY_ENV, DEFAULT_PORT, HEALTH_INTERVAL, Agent, agent_key, code_version, parse_address
+from agent import (
+    AGENT_KEY_ENV, DEFAULT_PORT, HEALTH_INTERVAL, Agent, agent_key, code_version, parse_address, recv_msg, send_msg,
+)
 from bot import DEFAULT_ROOM, generate_random_nickname
 from dashboard import DASHBOARD_PASSWORD_ENV, DEFAULT_DASHBOARD_PORT, start_dashboard
 
@@ -150,6 +152,7 @@ HEADROOM_CPU = 65.0        # A machine must be below this to take a bot moved of
 CPU_WINDOW = 6             # Health samples averaged (one every HEALTH_INTERVAL seconds -> 30s)
 REBALANCE_COOLDOWN = 60.0  # Seconds between moving bots off overloaded machines
 DEFAULT_WAIT_AGENTS = 15.0  # Seconds to let remote agents connect before placing bots
+DEFAULT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".config", "powerline-bot", "state.json")
 AGENT_TIMEOUT = 30.0       # An agent silent this long (it reports every HEALTH_INTERVAL) counts as gone
 MIN_REFETCH_INTERVAL = 15.0  # Seconds between extra Webshare refreshes triggered by proxy failures
 HEALTHY_RUN = 120.0        # A bot that ran this long before exiting has its restart backoff reset
@@ -202,20 +205,20 @@ class RemoteAgent:
 
     def send(self, msg: dict):
         try:
-            self.conn.send(msg)
+            send_msg(self.conn, msg)
         except (OSError, EOFError, ValueError):
             self.alive = False
 
     def receive(self):
         try:
             while self.alive and self.conn.poll(0):
-                msg = self.conn.recv()
+                msg = recv_msg(self.conn)
                 self.last_seen = time.time()
                 if msg["type"] == "health":
                     self.last_health = msg
                 elif msg["type"] == "exited":
                     self.events.append(msg)
-        except (OSError, EOFError):
+        except (OSError, EOFError, ValueError):
             self.alive = False
         if self.alive and time.time() - self.last_seen > AGENT_TIMEOUT:
             # A machine that lost power or network never closes its connection.
@@ -248,7 +251,7 @@ class RemoteAgent:
 # Coordinator
 # ============================================================================
 class Coordinator:
-    def __init__(self, args: argparse.Namespace, agents: List):
+    def __init__(self, args: argparse.Namespace, agents: List, state_file: Optional[str] = None):
         self.args = args
         self.agents = list(agents)  # Agent (this machine) and RemoteAgent (other machines)
         self.proxy_mgr = WebshareManager(api_key=args.webshare_key)
@@ -282,6 +285,58 @@ class Coordinator:
             {"time": record.created, "level": record.levelname, "message": record.getMessage()}
         )
         logger.addHandler(events_handler)
+        # Kept across restarts: bot names, paused machines, machine bot limits, stopped bots.
+        self.state_file = state_file
+        self.saved_max: Dict[str, Optional[int]] = {}  # Machine name -> bot limit set from the dashboard
+        self.load_state()
+        for agent in self.agents:
+            self.apply_saved_limit(agent)
+
+    def load_state(self):
+        if not self.state_file or not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file) as f:
+                state = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning(f"[Coordinator] Couldn't read {self.state_file} ({e}); starting fresh.")
+            return
+        names = [n for n in state.get("nicknames", []) if isinstance(n, str)]
+        self.nicknames[:len(names)] = names[:len(self.nicknames)]
+        self.paused = set(state.get("paused", []))
+        self.stopped = {b for b in state.get("stopped", []) if isinstance(b, int) and 0 <= b < self.total}
+        self.saved_max = {k: v for k, v in state.get("max_bots", {}).items() if v is None or isinstance(v, int)}
+        logger.info(f"[Coordinator] Restored bot names and settings from {self.state_file}.")
+
+    def save_state(self):
+        if not self.state_file:
+            return
+        state = {
+            "nicknames": self.nicknames,
+            "paused": sorted(self.paused),
+            "stopped": sorted(self.stopped),
+            "max_bots": self.saved_max,
+        }
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, self.state_file)  # Never leave a half-written file
+        except OSError as e:
+            logger.warning(f"[Coordinator] Couldn't save {self.state_file}: {e}")
+
+    def apply_saved_limit(self, agent):
+        """Re-apply a bot limit set from the dashboard when its machine (re)connects."""
+        if agent.name not in self.saved_max:
+            return
+        limit = self.saved_max[agent.name]
+        if isinstance(agent, RemoteAgent):
+            agent.send({"type": "set_max_bots", "max_bots": limit})
+            agent.last_health = dict(agent.last_health, max_bots=limit)
+        else:
+            agent.max_bots = limit
+        self.max_bots[id(agent)] = limit
 
     @property
     def total(self) -> int:
@@ -290,34 +345,51 @@ class Coordinator:
     # --- Agents -------------------------------------------------------------
     def listen(self, address: Tuple[str, int], key: bytes):
         """Accept agents from other machines in the background."""
-        listener = multiprocessing.connection.Listener(address, authkey=key)
+        # No authkey on the listener itself: each connection proves the key in its own thread,
+        # so one that connects and never answers can't stop other agents from joining.
+        listener = multiprocessing.connection.Listener(address)
         logger.info(f"[Coordinator] Waiting for agents on {address[0]}:{address[1]} (code version {code_version()})")
+
+        def handshake(conn: multiprocessing.connection.Connection):
+            try:
+                check_and_join(conn)
+            except Exception as e:  # Never let one bad connection print a traceback
+                logger.warning(f"[Coordinator] Dropped a connection after an unexpected error: {e!r}")
+                conn.close()
+
+        def check_and_join(conn: multiprocessing.connection.Connection):
+            try:
+                # Same mutual check Listener(authkey=...) does: both sides prove they know the key.
+                multiprocessing.connection.deliver_challenge(conn, key)
+                multiprocessing.connection.answer_challenge(conn, key)
+                hello = recv_msg(conn) if conn.poll(10) else None
+            except (multiprocessing.AuthenticationError, OSError, EOFError, ValueError) as e:
+                logger.warning(f"[Coordinator] Refused a connection: {e or type(e).__name__}")
+                conn.close()
+                return
+            if not hello or hello.get("type") != "hello":
+                conn.close()
+                return
+            if hello.get("version") != code_version():
+                reason = f"code version {hello.get('version')} differs from the coordinator's {code_version()}; update its files"
+                logger.warning(f"[Coordinator] Agent {hello.get('agent')} rejected: {reason}")
+                try:
+                    send_msg(conn, {"type": "rejected", "reason": reason})
+                except OSError:
+                    pass
+                conn.close()
+                return
+            with self.joined_lock:
+                self.joined.append(RemoteAgent(conn, hello))
 
         def accept_loop():
             while True:
                 try:
                     conn = listener.accept()
-                except (multiprocessing.AuthenticationError, OSError) as e:
-                    logger.warning(f"[Coordinator] Refused a connection: {e}")
+                except OSError as e:
+                    logger.warning(f"[Coordinator] Accept failed: {e}")
                     continue
-                try:
-                    hello = conn.recv() if conn.poll(10) else None
-                except (OSError, EOFError):
-                    hello = None
-                if not hello or hello.get("type") != "hello":
-                    conn.close()
-                    continue
-                if hello["version"] != code_version():
-                    reason = f"code version {hello['version']} differs from the coordinator's {code_version()}; update its files"
-                    logger.warning(f"[Coordinator] Agent {hello['agent']} rejected: {reason}")
-                    try:
-                        conn.send({"type": "rejected", "reason": reason})
-                    except OSError:
-                        pass
-                    conn.close()
-                    continue
-                with self.joined_lock:
-                    self.joined.append(RemoteAgent(conn, hello))
+                threading.Thread(target=handshake, args=(conn,), name="agent-handshake", daemon=True).start()
 
         threading.Thread(target=accept_loop, name="agent-listener", daemon=True).start()
 
@@ -326,6 +398,7 @@ class Coordinator:
             joined, self.joined = self.joined, []
         for agent in joined:
             self.agents.append(agent)
+            self.apply_saved_limit(agent)
             health = agent.last_health
             logger.info(
                 f"[Coordinator] Agent {agent.name} joined ({health['cpu_count']} CPU threads, "
@@ -576,6 +649,7 @@ class Coordinator:
             else:
                 agent.max_bots = limit
             self.max_bots[id(agent)] = limit
+            self.saved_max[agent.name] = limit
             logger.info(
                 f"[Coordinator] Dashboard: {agent.name} limited to {limit} bots."
                 if limit is not None else f"[Coordinator] Dashboard: {agent.name} no longer has a bot limit."
@@ -602,6 +676,7 @@ class Coordinator:
                 self.run_command(cmd)
             except Exception as e:
                 logger.error(f"[Coordinator] Dashboard command {cmd!r} failed: {e}")
+            self.save_state()
 
     def build_snapshot(self) -> dict:
         """Everything the dashboard shows, as plain JSON-able data."""
@@ -683,7 +758,10 @@ class Coordinator:
     def shutdown(self, *_):
         logger.info("[Coordinator] Shutting down all bots...")
         for agent in self.agents:
-            agent.stop_all()
+            if isinstance(agent, RemoteAgent):
+                agent.stop_all()  # The remote agent stops its bots itself
+            else:
+                agent.stop_all(wait=True)
         logger.info("[Coordinator] All bots stopped cleanly.")
         sys.exit(0)
 
@@ -715,11 +793,12 @@ class Coordinator:
             logger.info(f"[Coordinator] Group {g} on {proxy['host']}:{proxy['port']} ({args.bots_per_proxy} bots)")
             if start_stopped:
                 continue
-            for k, bot_id in enumerate(self.group_bots(g)):
+            for k, bot_id in enumerate(b for b in self.group_bots(g) if b not in self.stopped):
                 self.place_bot(bot_id, (k * args.stagger_interval) + random.uniform(1.0, 3.5))
         if start_stopped:
             self.stopped.update(range(self.total))
             logger.info("[Coordinator] All bots start stopped; start them from the dashboard.")
+        self.save_state()
 
         self.last_fetch = time.time()
         next_proxy_check = time.time() + args.proxy_check_interval
@@ -796,6 +875,11 @@ def main():
     )
     parser.add_argument("--no-local-agent", action="store_true", help="Run no bots on this machine (needs --listen)")
     parser.add_argument(
+        "--state-file",
+        default=DEFAULT_STATE_FILE,
+        help="Where bot names and dashboard settings are kept across restarts (default: %(default)s)",
+    )
+    parser.add_argument(
         "--start-stopped",
         action="store_true",
         help="Start with every bot stopped, to be started from the dashboard (useful when started at boot)",
@@ -825,7 +909,7 @@ def main():
     agents = [] if args.no_local_agent else [
         Agent(headless=args.headless, debug_dir=args.debug_dir, max_bots=args.local_max_bots)
     ]
-    coordinator = Coordinator(args, agents)
+    coordinator = Coordinator(args, agents, state_file=args.state_file)
     if args.listen:
         coordinator.listen(parse_address(args.listen), agent_key())
     if args.dashboard:

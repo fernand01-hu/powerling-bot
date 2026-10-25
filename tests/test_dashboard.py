@@ -134,3 +134,36 @@ class CoordinatorCommandTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StateFileTest(unittest.TestCase):
+    def test_names_and_settings_survive_a_restart(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "state.json")
+        one = Agent(name="one", worker_target=fake_steady_worker)
+        first = make_coordinator(one)
+        first.state_file = path
+        for bot_id in range(4):
+            first.place_bot(bot_id, 0)
+        for cmd in ({"action": "stop_bot", "bot": 2}, {"action": "set_max_bots", "machine": "one", "max_bots": 3},
+                    {"action": "pause_machine", "machine": "one"}):
+            first.commands.put(cmd)
+        first.run_commands()
+        one.stop_all()
+
+        again = Agent(name="one", worker_target=fake_steady_worker)
+        args = argparse.Namespace(webshare_key="x", room="room", groups=2, bots_per_proxy=2, stagger_interval=0.0)
+        second = Coordinator(args, [again], state_file=path)
+        self.assertEqual(second.nicknames, first.nicknames)
+        self.assertEqual(second.stopped, {2})
+        self.assertEqual(second.paused, {"one"})
+        self.assertEqual(again.max_bots, 3)  # Re-applied to the machine on start
+
+    def test_unreadable_state_file_starts_fresh(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "state.json")
+        with open(path, "w") as f:
+            f.write("{not json")
+        args = argparse.Namespace(webshare_key="x", room="room", groups=1, bots_per_proxy=1, stagger_interval=0.0)
+        coord = Coordinator(args, [], state_file=path)
+        self.assertEqual(len(coord.nicknames), 1)

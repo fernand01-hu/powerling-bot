@@ -70,7 +70,7 @@ python3 agent.py --coordinator 192.168.1.96 --headless
 | `--name` | hostname | Name shown in the coordinator's log |
 | `--debug-dir` | off | Save screenshots of key moments |
 
-If the connection drops, an agent stops its bots and reconnects every 5s, so either side can be restarted at any time. A bot that keeps failing waits longer before each restart (up to 60s), and proxy failures make the coordinator re-read Webshare's list right away, since they usually mean Webshare just rotated its IPs.
+If the connection drops, an agent stops its bots and reconnects every 5s, so either side can be restarted at any time. Bot names, paused machines, machine bot limits and stopped bots are saved to `~/.config/powerline-bot/state.json` on the coordinator (`--state-file` to change it), so they survive restarts. Coordinator and agents exchange plain JSON messages (never pickle) after both prove they know the shared key. A bot that keeps failing waits longer before each restart (up to 60s), and proxy failures make the coordinator re-read Webshare's list right away, since they usually mean Webshare just rotated its IPs.
 
 ## Dashboard
 

@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import os
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Tuple
@@ -103,10 +104,17 @@ def make_handler(coordinator, password: str):
     return Handler
 
 
+class DashboardServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # A browser closing the page mid-request isn't worth a traceback in the coordinator's log.
+        logger.warning(f"[Dashboard] Request from {client_address[0]} failed: {sys.exc_info()[1]!r}")
+
+
 def start_dashboard(coordinator, address: Tuple[str, int], password: str) -> ThreadingHTTPServer:
     """Serve the dashboard in a background thread."""
-    server = ThreadingHTTPServer(address, make_handler(coordinator, password))
-    server.daemon_threads = True
+    server = DashboardServer(address, make_handler(coordinator, password))
     threading.Thread(target=server.serve_forever, name="dashboard", daemon=True).start()
     logger.info(f"[Dashboard] Serving on http://{address[0]}:{server.server_address[1]}/")
     return server
