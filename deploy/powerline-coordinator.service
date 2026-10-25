@@ -1,0 +1,21 @@
+# Coordinator + dashboard as a systemd user service.
+# Install: copy to ~/.config/systemd/user/, create ~/.config/powerline-bot/env (see env.example), then
+#   systemctl --user daemon-reload && systemctl --user enable --now powerline-coordinator
+#   loginctl enable-linger      # start at boot, without anyone logged in
+[Unit]
+Description=Powerline bot coordinator and dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/powerline-bot
+EnvironmentFile=%h/.config/powerline-bot/env
+ExecStart=/usr/bin/python3 -u coordinator.py $COORDINATOR_ARGS
+Restart=on-failure
+RestartSec=10
+# Ctrl+C-style stop, so every agent stops its bots cleanly.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

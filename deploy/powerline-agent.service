@@ -1,0 +1,19 @@
+# Agent (runs bots for the coordinator) as a systemd user service on a Linux machine.
+# Install: copy to ~/.config/systemd/user/, create ~/.config/powerline-bot/env (see env.example), then
+#   systemctl --user daemon-reload && systemctl --user enable --now powerline-agent
+[Unit]
+Description=Powerline bot agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/powerline-bot
+EnvironmentFile=%h/.config/powerline-bot/env
+ExecStart=/usr/bin/python3 -u agent.py $AGENT_ARGS
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -83,6 +83,34 @@ python3 coordinator.py --listen 0.0.0.0 --dashboard 0.0.0.0 --headless   # then 
 
 Log in with any user name and that password. Keep port 4042 inside your network (don't forward it on the router).
 
+## Start automatically
+
+`deploy/` has everything to start the system when the machines boot. With `--start-stopped` the coordinator, dashboard and agents come up but every bot waits until you press **Start all** (or start single bots) on the dashboard.
+
+**Coordinator machine** (Linux, systemd user service):
+
+```bash
+mkdir -p ~/.config/powerline-bot ~/.config/systemd/user
+cp deploy/env.example ~/.config/powerline-bot/env && chmod 600 ~/.config/powerline-bot/env
+nano ~/.config/powerline-bot/env          # fill in the keys and password, keep COORDINATOR_ARGS
+cp deploy/powerline-coordinator.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now powerline-coordinator
+loginctl enable-linger                     # run at boot without anyone logged in
+journalctl --user -u powerline-coordinator -f   # follow its log
+```
+
+**Other Linux machines**: the same with `deploy/powerline-agent.service` (`systemctl --user enable --now powerline-agent`); their env file only needs `POWERLINE_AGENT_KEY` and `AGENT_ARGS`.
+
+**Windows**: copy `deploy/start-agent.cmd` next to `agent.py`, then in a command prompt:
+
+```bat
+setx POWERLINE_AGENT_KEY "same-secret-as-the-coordinator"
+schtasks /Create /TN "Powerline agent" /SC ONLOGON /RL LIMITED /F /TR "\"%USERPROFILE%\powerline-bot\start-agent.cmd\""
+schtasks /Run /TN "Powerline agent"
+```
+
+It starts when you log in and restarts the agent if it ever exits (log: `agent.log`).
+
 ## Tests
 
 ```bash

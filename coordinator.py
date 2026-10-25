@@ -687,7 +687,7 @@ class Coordinator:
         logger.info("[Coordinator] All bots stopped cleanly.")
         sys.exit(0)
 
-    def run(self, wait_agents: float = 0.0):
+    def run(self, wait_agents: float = 0.0, start_stopped: bool = False):
         args = self.args
         while not self.proxy_mgr.fetch_proxies():
             logger.error("[Coordinator] No proxies available from Webshare, retrying in 30s...")
@@ -713,8 +713,13 @@ class Coordinator:
         for g in range(args.groups):
             proxy = self.group_proxies[g]
             logger.info(f"[Coordinator] Group {g} on {proxy['host']}:{proxy['port']} ({args.bots_per_proxy} bots)")
+            if start_stopped:
+                continue
             for k, bot_id in enumerate(self.group_bots(g)):
                 self.place_bot(bot_id, (k * args.stagger_interval) + random.uniform(1.0, 3.5))
+        if start_stopped:
+            self.stopped.update(range(self.total))
+            logger.info("[Coordinator] All bots start stopped; start them from the dashboard.")
 
         self.last_fetch = time.time()
         next_proxy_check = time.time() + args.proxy_check_interval
@@ -790,6 +795,11 @@ def main():
              f"needs ${DASHBOARD_PASSWORD_ENV})",
     )
     parser.add_argument("--no-local-agent", action="store_true", help="Run no bots on this machine (needs --listen)")
+    parser.add_argument(
+        "--start-stopped",
+        action="store_true",
+        help="Start with every bot stopped, to be started from the dashboard (useful when started at boot)",
+    )
     parser.add_argument("--local-max-bots", type=int, help="Never run more than this many bots on this machine")
     args = parser.parse_args()
 
@@ -822,7 +832,7 @@ def main():
         host, _, port = args.dashboard.rpartition(":")
         address = (host, int(port)) if host else (args.dashboard, DEFAULT_DASHBOARD_PORT)
         start_dashboard(coordinator, address, os.environ[DASHBOARD_PASSWORD_ENV])
-    coordinator.run(wait_agents=args.wait_agents if args.listen else 0.0)
+    coordinator.run(wait_agents=args.wait_agents if args.listen else 0.0, start_stopped=args.start_stopped)
 
 
 if __name__ == "__main__":
