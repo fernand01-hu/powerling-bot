@@ -10,6 +10,10 @@
     --text: #e6edf3; --muted: #8b98a8; --accent: #2ee6c8; --accent-dim: #19756a;
     --good: #3fb950; --warn: #d29922; --bad: #f85149; --info: #58a6ff; --idle: #8b98a8;
     --shadow: 0 1px 0 rgba(255,255,255,0.03) inset;
+    /* Chart series, in fixed order (validated: dark surface #161b22) */
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+    --grid: #232b36;
     color-scheme: dark;
   }
   @media (prefers-color-scheme: light) {
@@ -18,6 +22,9 @@
       --text: #1b2430; --muted: #5d6b7c; --accent: #0f9e88; --accent-dim: #b8ebe2;
       --good: #1a7f37; --warn: #9a6700; --bad: #cf222e; --info: #0969da; --idle: #6e7781;
       --shadow: none;
+      --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+      --series-5: #e87ba4; --series-6: #008300; --series-7: #6250d6; --series-8: #e34948;
+      --grid: #e8ecf0;
       color-scheme: light;
     }
   }
@@ -32,6 +39,15 @@
   .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--bad); margin-right: 6px; }
   .dot.ok { background: var(--good); }
   main { max-width: 1280px; margin: 0 auto; padding: 18px 16px 40px; display: grid; gap: 16px; }
+  .alerts { display: grid; gap: 8px; }
+  .alert { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px;
+           border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 12%, var(--panel)); }
+  .alert.error { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--panel)); }
+  .alert .icon { font-weight: 700; }
+  .alert.warning .icon { color: var(--warn); }
+  .alert.error .icon { color: var(--bad); }
+  .alert .text { flex: 1; overflow-wrap: anywhere; }
+  .alert button { padding: 2px 8px; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .tile, section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
   .tile { padding: 14px 16px; }
@@ -42,12 +58,14 @@
   section h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
                display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
   .grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
-  @media (max-width: 860px) { .grid-2 { grid-template-columns: minmax(0, 1fr); } }
+  .grid-wide { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; }
+  @media (max-width: 860px) { .grid-2, .grid-wide { grid-template-columns: minmax(0, 1fr); } }
   .machines { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
   .machine { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
   .machine.paused { opacity: .65; }
   .machine .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .machine .name { font-weight: 600; overflow-wrap: anywhere; }
+  .machine .name { font-weight: 600; overflow-wrap: anywhere; display: flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
   .badge { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
   .bar { height: 7px; border-radius: 4px; background: var(--border); overflow: hidden; margin: 4px 0 8px; }
   .bar > div { height: 100%; background: var(--accent); transition: width .4s; }
@@ -57,16 +75,25 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
   button { font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 6px; cursor: pointer;
            background: var(--panel); color: var(--text); border: 1px solid var(--border); }
-  button:hover { border-color: var(--accent); }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
   button.primary { background: var(--accent-dim); border-color: var(--accent); }
-  button.danger:hover { border-color: var(--bad); color: var(--bad); }
-  input[type=number] { width: 70px; font: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px;
-                       background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+  button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+  button.icon-btn { padding: 4px 7px; }
+  input[type=number], input[type=text], select {
+    font: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+  input[type=number] { width: 70px; }
+  input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; vertical-align: middle; }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
   td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
   tr:last-child td { border-bottom: none; }
+  tr.selected td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .bulk { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px 10px; margin-bottom: 10px;
+          border: 1px solid var(--accent); border-radius: 8px; background: color-mix(in srgb, var(--accent) 7%, var(--panel)); }
+  .bulk[hidden] { display: none; }
   .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
   .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
   .s-playing::before { background: var(--good); }
@@ -75,12 +102,41 @@
   .s-stopped::before { background: var(--idle); }
   .muted { color: var(--muted); }
   .countdown { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
-  .events { max-height: 260px; overflow-y: auto; scrollbar-color: var(--border) transparent; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  .events div { padding: 2px 0; border-bottom: 1px dashed var(--border); overflow-wrap: anywhere; }
-  .events .WARNING { color: var(--warn); }
-  .events .ERROR { color: var(--bad); }
+  .mono { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .events, .logs { overflow-y: auto; scrollbar-color: var(--border) transparent; }
+  .events { max-height: 300px; }
+  .logs { height: 300px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+  .events div, .logs div { padding: 2px 0; border-bottom: 1px dashed var(--border); overflow-wrap: anywhere; }
+  .events .WARNING, .logs .WARNING { color: var(--warn); }
+  .events .ERROR, .logs .ERROR { color: var(--bad); }
+  .logs .who { color: var(--info); }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .chart h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 4px; min-height: 18px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .plot { position: relative; height: 170px; }
+  .plot svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .plot .axis { fill: var(--muted); font-size: 10px; }
+  .plot .gridline { stroke: var(--grid); stroke-width: 1; }
+  .plot .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .plot .end-label { font-size: 10px; fill: var(--text); }
+  .plot .cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+  .plot .hover-dot { stroke: var(--panel); stroke-width: 2; }
+  .tooltip { position: absolute; pointer-events: none; background: var(--panel-2); border: 1px solid var(--border);
+             border-radius: 6px; padding: 6px 8px; font-size: 12px; white-space: nowrap; z-index: 2; display: none;
+             box-shadow: 0 4px 14px rgba(0,0,0,.25); }
+  .tooltip .t { color: var(--muted); margin-bottom: 2px; }
+  .empty { color: var(--muted); font-size: 12px; padding: 60px 0; text-align: center; }
+  .settings { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center; font-size: 13px; }
+  .settings input { width: 110px; }
+  .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; z-index: 10; padding: 16px; }
+  .modal-back.show { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; max-width: 760px; width: 100%; }
+  .modal .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .modal img { width: 100%; border-radius: 6px; border: 1px solid var(--border); display: block; }
+  .modal .wait { padding: 80px 0; text-align: center; color: var(--muted); }
   .toast { position: fixed; bottom: 16px; right: 16px; background: var(--panel); border: 1px solid var(--accent);
-           padding: 8px 12px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+           padding: 8px 12px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 20; }
   .toast.show { opacity: 1; }
 </style>
 </head>
@@ -95,6 +151,8 @@
 </header>
 
 <main>
+  <div class="alerts" id="alerts"></div>
+
   <div class="tiles">
     <div class="tile"><div class="label">Playing</div><div class="value" id="t-playing">–</div><div class="sub" id="t-total">of – bots</div></div>
     <div class="tile"><div class="label">Not in game</div><div class="value" id="t-other">–</div><div class="sub" id="t-other-sub">–</div></div>
@@ -121,11 +179,30 @@
         <button data-action="start_all">Start all</button>
       </span>
     </h2>
+    <div class="bulk" id="bulk" hidden>
+      <b id="bulk-count">0 selected</b>
+      <button class="danger" data-bulk="stop_bots">Stop</button>
+      <button data-bulk="start_bots">Start</button>
+      <button data-bulk="restart_bots">Restart</button>
+      <button id="bulk-clear">Clear selection</button>
+    </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>#</th><th>Name</th><th>State</th><th>For</th><th>Machine</th><th>Group</th><th>IP</th><th>Rounds</th><th>Last respawn</th><th></th></tr></thead>
+        <thead><tr>
+          <th><input type="checkbox" id="select-all" aria-label="Select all bots"></th>
+          <th>#</th><th>Name</th><th>State</th><th>For</th><th>Machine</th><th>Group</th><th>IP</th><th>Rounds</th><th>Last respawn</th><th></th>
+        </tr></thead>
         <tbody id="bots"></tbody>
       </table>
+    </div>
+  </section>
+
+  <section>
+    <h2><span>Last hour</span><span class="muted" style="text-transform:none;letter-spacing:0" id="history-note"></span></h2>
+    <div class="charts">
+      <div class="chart"><h3>CPU per machine (%)</h3><div class="legend" id="legend-cpu"></div><div class="plot" id="chart-cpu"></div></div>
+      <div class="chart"><h3>RAM used per machine (%)</h3><div class="legend" id="legend-ram"></div><div class="plot" id="chart-ram"></div></div>
+      <div class="chart"><h3>Bots</h3><div class="legend" id="legend-bots"></div><div class="plot" id="chart-bots"></div></div>
     </div>
   </section>
 
@@ -149,11 +226,48 @@
     </section>
 
     <section>
-      <h2>Events</h2>
-      <div class="events" id="events"></div>
+      <h2>Settings</h2>
+      <form class="settings" id="settings-form">
+        <label for="set-room">Room code</label><input type="text" id="set-room" maxlength="16" pattern="[A-Za-z0-9]{1,16}" required>
+        <label for="set-bpp">Bots per group</label><input type="number" id="set-bpp" min="1" max="10" required>
+        <label for="set-check">Proxy check (s)</label><input type="number" id="set-check" min="15" max="3600" required>
+        <label for="set-stagger">Join stagger (s)</label><input type="number" id="set-stagger" min="0" max="60" step="0.5" required>
+        <span></span>
+        <span class="row" style="margin:0">
+          <button class="primary" type="submit">Save</button>
+          <button type="button" id="settings-reset">Undo changes</button>
+        </span>
+      </form>
+      <p class="muted" style="font-size:12px;margin:10px 0 0">Changing the room or bots per group restarts the bots. Settings are saved and kept after a restart.</p>
+    </section>
+  </div>
+
+  <div class="grid-wide">
+    <section>
+      <h2>
+        <span>Live logs</span>
+        <span class="row" style="margin:0">
+          <select id="log-machine" aria-label="Machine"><option value="">All machines</option></select>
+          <select id="log-bot" aria-label="Bot"><option value="">All bots</option></select>
+          <select id="log-level" aria-label="Level"><option value="">All levels</option><option value="WARNING">Warnings and errors</option></select>
+        </span>
+      </h2>
+      <div class="logs mono" id="logs"></div>
+    </section>
+    <section>
+      <h2>Coordinator events</h2>
+      <div class="events mono" id="events"></div>
     </section>
   </div>
 </main>
+
+<div class="modal-back" id="shot-modal" role="dialog" aria-modal="true" aria-labelledby="shot-title">
+  <div class="modal">
+    <div class="head"><b id="shot-title">Screenshot</b><span class="row" style="margin:0"><button id="shot-again">Take another</button><button id="shot-close">Close</button></span></div>
+    <div id="shot-body"></div>
+    <div class="muted" id="shot-caption" style="font-size:12px;margin-top:8px"></div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -162,6 +276,10 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<
 let state = null;
 let serverOffset = 0;  // Server clock minus browser clock, so countdowns match the coordinator
 let editingGroups = false;
+let settingsDirty = false;
+const selected = new Set();
+const dismissed = new Map();  // Alert key -> text when dismissed (it comes back if the text changes)
+const machineColors = new Map();  // Machine name -> series slot, first seen first; never re-ranked
 
 function ago(seconds) {
   if (seconds == null || !isFinite(seconds)) return "–";
@@ -172,37 +290,63 @@ function ago(seconds) {
   return Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m";
 }
 const now = () => Date.now() / 1000 + serverOffset;
+const clock = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+const clockSec = (t) => new Date(t * 1000).toLocaleTimeString();
+const cmd = (obj) => esc(JSON.stringify(obj));
+
+function machineColor(name) {
+  if (!machineColors.has(name)) machineColors.set(name, (machineColors.size % 8) + 1);
+  return `var(--series-${machineColors.get(name)})`;
+}
 
 function toast(text) {
   const t = $("toast");
   t.textContent = text;
   t.classList.add("show");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => t.classList.remove("show"), 1800);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 2000);
 }
 
-async function command(cmd, label) {
+async function command(body, label) {
   try {
     const res = await fetch("/api/command", {
       method: "POST",
       headers: {"Content-Type": "application/json", "X-Requested-With": "dashboard"},
-      body: JSON.stringify(cmd),
+      body: JSON.stringify(body),
     });
     toast(res.ok ? (label || "Sent") : "Failed: " + res.status);
     setTimeout(refresh, 1200);
+    return res.ok;
   } catch (e) {
     toast("Failed: " + e);
+    return false;
   }
 }
 
+async function getJSON(url) {
+  const res = await fetch(url, {cache: "no-store"});
+  if (!res.ok) throw new Error(res.status);
+  return res.json();
+}
+
+/* ---------- Alerts ---------- */
+function renderAlerts() {
+  const shown = state.alerts.filter((a) => dismissed.get(a.key) !== a.text);
+  $("alerts").innerHTML = shown.map((a) => `<div class="alert ${esc(a.level)}" role="status">
+      <span class="icon">${a.level === "error" ? "&#9940; Error" : "&#9888; Warning"}</span>
+      <span class="text">${esc(a.text)}</span>
+      <button data-dismiss="${esc(a.key)}" data-text="${esc(a.text)}" aria-label="Dismiss">&times;</button>
+    </div>`).join("");
+}
+
+/* ---------- Tiles ---------- */
 function renderTiles() {
   const bots = state.bots;
   const counts = {};
   bots.forEach((b) => counts[b.state] = (counts[b.state] || 0) + 1);
   $("t-playing").textContent = counts.playing || 0;
   $("t-total").textContent = "of " + bots.length + " bots";
-  const other = bots.length - (counts.playing || 0);
-  $("t-other").textContent = other;
+  $("t-other").textContent = bots.length - (counts.playing || 0);
   $("t-other-sub").textContent = Object.entries(counts).filter(([k]) => k !== "playing")
     .map(([k, v]) => v + " " + k).join(" · ") || "all playing";
   const paused = state.machines.filter((m) => m.paused).length;
@@ -227,6 +371,7 @@ function renderRotation() {
   $("t-rotation-sub").textContent = "every " + ago(freq) + " · list checked " + ago(now() - state.last_fetch) + " ago";
 }
 
+/* ---------- Machines ---------- */
 function renderMachines() {
   const el = $("machines");
   if (el.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;  // Don't wipe a value being typed
@@ -239,7 +384,7 @@ function renderMachines() {
     const memUsed = m.mem_total_mb ? 100 * (1 - m.mem_available_mb / m.mem_total_mb) : 0;
     const limit = m.max_bots == null ? "" : m.max_bots;
     return `<div class="machine ${m.paused ? "paused" : ""}">
-      <div class="top"><span class="name">${esc(m.name)}</span>
+      <div class="top"><span class="name"><span class="swatch" style="background:${machineColor(m.name)}"></span>${esc(m.name)}</span>
         <span class="badge">${esc(m.platform || "?")}${m.local ? " · coordinator" : ""}${m.paused ? " · paused" : ""}</span></div>
       <div class="kv" style="margin-top:8px"><span>CPU (${m.cpu_count} threads)</span><span>${m.cpu.toFixed(0)}%</span></div>
       <div class="bar ${cpuClass}"><div style="width:${Math.min(100, m.cpu)}%"></div></div>
@@ -248,30 +393,41 @@ function renderMachines() {
       <div class="kv"><span>Bots</span><span>${m.bots.length}${m.max_bots != null ? " / max " + m.max_bots : ""}</span></div>
       <div class="row">
         ${m.paused
-          ? `<button class="primary" data-cmd='${esc(JSON.stringify({action: "resume_machine", machine: m.name}))}'>Resume</button>`
-          : `<button class="danger" data-cmd='${esc(JSON.stringify({action: "pause_machine", machine: m.name}))}'>Pause</button>`}
+          ? `<button class="primary" data-cmd='${cmd({action: "resume_machine", machine: m.name})}'>Resume</button>`
+          : `<button data-cmd='${cmd({action: "pause_machine", machine: m.name})}'>Pause</button>`}
         <span class="muted">Max bots</span>
         <input type="number" min="0" max="100" placeholder="∞" value="${limit}" data-max-for="${esc(m.name)}">
         <button data-set-max="${esc(m.name)}">Set</button>
+      </div>
+      <div class="row">
+        <button data-confirm="${esc(m.local ? "Restart every bot on " + m.name + "?" : "Restart the agent on " + m.name + "? Its bots move to other machines meanwhile.")}"
+          data-cmd='${cmd({action: "restart_machine", machine: m.name})}'>${m.local ? "Restart bots" : "Restart agent"}</button>
+        <button class="danger" ${m.bots.length ? "" : "disabled"} data-confirm="${esc("Stop all " + m.bots.length + " bots on " + m.name + "?")}"
+          data-cmd='${cmd({action: "stop_machine_bots", machine: m.name})}'>Stop its bots</button>
       </div>
     </div>`;
   }).join("");
 }
 
+/* ---------- Bots + bulk ---------- */
 function renderBots() {
+  const ids = new Set(state.bots.map((b) => b.id));
+  [...selected].forEach((id) => { if (!ids.has(id)) selected.delete(id); });
   $("bots").innerHTML = state.bots.map((b) => {
     const running = !["stopped", "waiting"].includes(b.state) && b.machine;
     const since = b.since ? ago(now() - b.since) : "–";
     const actions = b.state === "stopped"
-      ? `<button class="primary" data-cmd='${esc(JSON.stringify({action: "start_bot", bot: b.id}))}'>Start</button>`
-      : `<button data-cmd='${esc(JSON.stringify({action: "restart_bot", bot: b.id}))}'>Restart</button>
-         <button class="danger" data-cmd='${esc(JSON.stringify({action: "stop_bot", bot: b.id}))}'>Stop</button>`;
-    return `<tr>
+      ? `<button class="primary" data-cmd='${cmd({action: "start_bot", bot: b.id})}'>Start</button>`
+      : `<button class="icon-btn" title="See its screen" aria-label="Screenshot of ${esc(b.name)}" ${running ? "" : "disabled"} data-shot="${b.id}">&#128247;</button>
+         <button data-cmd='${cmd({action: "restart_bot", bot: b.id})}'>Restart</button>
+         <button class="danger" data-cmd='${cmd({action: "stop_bot", bot: b.id})}'>Stop</button>`;
+    return `<tr class="${selected.has(b.id) ? "selected" : ""}">
+      <td><input type="checkbox" data-select="${b.id}" ${selected.has(b.id) ? "checked" : ""} aria-label="Select ${esc(b.name)}"></td>
       <td class="muted">${b.id}</td>
       <td>${esc(b.name)}</td>
       <td><span class="pill s-${esc(b.state)}">${esc(b.state)}</span>${b.failures > 1 ? ` <span class="badge">${b.failures} fails</span>` : ""}</td>
       <td class="muted">${running ? since : "–"}</td>
-      <td>${esc(b.machine || "–")}</td>
+      <td>${b.machine ? `<span class="swatch" style="background:${machineColor(b.machine)};margin-right:5px"></span>${esc(b.machine)}` : "–"}</td>
       <td>${b.group}</td>
       <td class="muted">${esc(b.proxy || "–")}</td>
       <td>${b.rounds || 0}</td>
@@ -279,8 +435,18 @@ function renderBots() {
       <td style="text-align:right">${actions}</td>
     </tr>`;
   }).join("");
+  renderBulk();
 }
 
+function renderBulk() {
+  $("bulk").hidden = selected.size === 0;
+  $("bulk-count").textContent = selected.size + " selected";
+  const all = state ? state.bots.length : 0;
+  $("select-all").checked = all > 0 && selected.size === all;
+  $("select-all").indeterminate = selected.size > 0 && selected.size < all;
+}
+
+/* ---------- Proxies, settings, events ---------- */
 function renderProxies() {
   $("proxies").innerHTML = state.proxies.map((p) => `<tr>
     <td>${esc(p.host)}<span class="muted">:${esc(p.port)}</span></td>
@@ -292,38 +458,213 @@ function renderProxies() {
   if (!editingGroups) $("groups-input").value = state.groups;
 }
 
-function renderEvents() {
-  $("events").innerHTML = state.events.slice().reverse().map((e) => {
-    const t = new Date(e.time * 1000).toLocaleTimeString();
-    return `<div class="${esc(e.level)}"><span class="muted">${t}</span> ${esc(e.message.replace(/^\[Coordinator\] /, ""))}</div>`;
-  }).join("") || '<div class="muted">No events yet.</div>';
+function fillSettings(force) {
+  if (settingsDirty && !force) return;
+  const s = state.settings;
+  $("set-room").value = s.room;
+  $("set-bpp").value = s.bots_per_proxy;
+  $("set-check").value = Math.round(s.proxy_check_interval);
+  $("set-stagger").value = s.stagger_interval;
+  settingsDirty = false;
 }
 
+function renderEvents() {
+  $("events").innerHTML = state.events.slice().reverse().map((e) =>
+    `<div class="${esc(e.level)}"><span class="muted">${clockSec(e.time)}</span> ${esc(e.message.replace(/^\[Coordinator\] /, ""))}</div>`
+  ).join("") || '<div class="muted">No events yet.</div>';
+}
+
+/* ---------- Live logs ---------- */
+function syncLogFilters() {
+  const mSel = $("log-machine"), bSel = $("log-bot");
+  const machines = state.machines.map((m) => m.name);
+  const mVal = mSel.value, bVal = bSel.value;
+  const mOpts = ['<option value="">All machines</option>'].concat(machines.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`)).join("");
+  if (mSel.dataset.opts !== mOpts) { mSel.innerHTML = mOpts; mSel.dataset.opts = mOpts; mSel.value = machines.includes(mVal) ? mVal : ""; }
+  const bOpts = ['<option value="">All bots</option>'].concat(state.bots.map((b) => `<option value="${b.id}">#${b.id} ${esc(b.name)}</option>`)).join("");
+  if (bSel.dataset.opts !== bOpts) { bSel.innerHTML = bOpts; bSel.dataset.opts = bOpts; bSel.value = bVal; }
+}
+
+async function refreshLogs() {
+  const params = new URLSearchParams({limit: "300"});
+  if ($("log-machine").value) params.set("machine", $("log-machine").value);
+  if ($("log-bot").value !== "") params.set("bot", $("log-bot").value);
+  let lines;
+  try { lines = await getJSON("/api/logs?" + params); } catch (e) { return; }
+  if ($("log-level").value) lines = lines.filter((l) => l.level === "WARNING" || l.level === "ERROR");
+  const box = $("logs");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;  // Follow new lines unless scrolled up
+  box.innerHTML = lines.map((l) => {
+    const who = l.bot == null ? "agent" : "bot " + l.bot;
+    const text = l.message.replace(/^\[(Bot-\d+|Agent[^\]]*)\] /, "");  // The "who" column already says it
+    return `<div class="${esc(l.level)}"><span class="muted">${clockSec(l.time)}</span> <span class="who">${esc(l.machine)} · ${who}</span> ${esc(text)}</div>`;
+  }).join("") || '<div class="muted">No log lines yet.</div>';
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+/* ---------- Charts (inline SVG line charts, one y-axis each) ---------- */
+function niceMax(v) {
+  if (v <= 4) return 4;
+  const step = Math.pow(10, Math.floor(Math.log10(v)));
+  return Math.ceil(v / step) * step;
+}
+
+function drawLineChart(plotId, legendId, series, yMax, unit) {
+  const plot = $(plotId);
+  const legend = $(legendId);
+  legend.innerHTML = series.length > 1
+    ? series.map((s) => `<span><span class="swatch" style="background:${s.color}"></span>${esc(s.name)}</span>`).join("")
+    : "";
+  const pts = series.flatMap((s) => s.points);
+  if (pts.length < 2) {
+    plot.innerHTML = '<div class="empty">Collecting data…</div>';
+    return;
+  }
+  const W = plot.clientWidth || 300, H = plot.clientHeight || 170;
+  const pad = {l: 32, r: 64, t: 6, b: 20};
+  const t1 = now(), t0 = Math.max(Math.min(...pts.map((p) => p[0])), t1 - 3600);
+  const x = (t) => pad.l + (t - t0) / Math.max(1, t1 - t0) * (W - pad.l - pad.r);
+  const y = (v) => pad.t + (1 - Math.min(v, yMax) / yMax) * (H - pad.t - pad.b);
+  const ticks = [0, yMax / 2, yMax];
+  let svg = ticks.map((v) => `<line class="gridline" x1="${pad.l}" x2="${W - pad.r}" y1="${y(v)}" y2="${y(v)}"/>
+    <text class="axis" x="${pad.l - 6}" y="${y(v) + 3}" text-anchor="end">${v}${unit}</text>`).join("");
+  const span = t1 - t0, stepT = span > 1800 ? 900 : span > 600 ? 300 : 60;
+  for (let t = Math.ceil(t0 / stepT) * stepT; t <= t1; t += stepT) {
+    svg += `<text class="axis" x="${x(t)}" y="${H - 4}" text-anchor="middle">${clock(t)}</text>`;
+  }
+  const ends = [];
+  series.forEach((s) => {
+    const p = s.points.filter((q) => q[0] >= t0);
+    if (!p.length) return;
+    svg += `<path class="series" stroke="${s.color}" d="${p.map((q, i) => (i ? "L" : "M") + x(q[0]).toFixed(1) + " " + y(q[1]).toFixed(1)).join(" ")}"/>`;
+    ends.push({name: s.name, y: y(p[p.length - 1][1]), x: x(p[p.length - 1][0])});
+  });
+  // Direct labels at the line ends, nudged apart so they never overlap.
+  ends.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++) ends[i].y = Math.max(ends[i].y, ends[i - 1].y + 12);
+  ends.forEach((e) => {
+    const short = e.name.length > 12 ? e.name.slice(0, 11) + "…" : e.name;
+    svg += `<text class="end-label" x="${e.x + 5}" y="${e.y + 3}">${esc(short)}</text>`;
+  });
+  svg += `<line class="cross" id="${plotId}-cross" y1="${pad.t}" y2="${H - pad.b}" visibility="hidden"/><g id="${plotId}-dots"></g>`;
+  plot.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(series.map((s) => s.name).join(", "))}">${svg}</svg><div class="tooltip" id="${plotId}-tip"></div>`;
+
+  // Hover: crosshair + values of every series at the nearest sample.
+  const svgEl = plot.querySelector("svg");
+  const tip = $(plotId + "-tip"), cross = $(plotId + "-cross"), dots = $(plotId + "-dots");
+  svgEl.onmousemove = (ev) => {
+    const r = svgEl.getBoundingClientRect();
+    const mx = (ev.clientX - r.left) * (W / r.width);
+    const t = t0 + (mx - pad.l) / (W - pad.l - pad.r) * (t1 - t0);
+    if (mx < pad.l || mx > W - pad.r) { svgEl.onmouseleave(); return; }
+    const rows = series.map((s) => {
+      let best = null;
+      for (const q of s.points) if (!best || Math.abs(q[0] - t) < Math.abs(best[0] - t)) best = q;
+      return best && Math.abs(best[0] - t) < 60 ? {s, q: best} : null;
+    }).filter(Boolean);
+    if (!rows.length) { svgEl.onmouseleave(); return; }
+    const tx = x(rows[0].q[0]);
+    cross.setAttribute("x1", tx); cross.setAttribute("x2", tx); cross.setAttribute("visibility", "visible");
+    dots.innerHTML = rows.map(({s, q}) => `<circle class="hover-dot" r="4.5" cx="${x(q[0])}" cy="${y(q[1])}" fill="${s.color}"/>`).join("");
+    tip.innerHTML = `<div class="t">${clockSec(rows[0].q[0])}</div>` + rows.map(({s, q}) =>
+      `<div><span class="swatch" style="background:${s.color};margin-right:5px"></span>${esc(s.name)}: <b>${Math.round(q[1])}${unit}</b></div>`).join("");
+    tip.style.display = "block";
+    const left = tx / W * r.width;
+    tip.style.left = Math.min(left + 12, r.width - tip.offsetWidth) + "px";
+    tip.style.top = "4px";
+  };
+  svgEl.onmouseleave = () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); dots.innerHTML = ""; };
+}
+
+let historyData = null;
+async function refreshHistory() {
+  try { historyData = await getJSON("/api/history"); } catch (e) { return; }
+  drawCharts();
+}
+
+function drawCharts() {
+  if (!historyData) return;
+  const names = Object.keys(historyData.machines);
+  const machineSeries = (idx) => names.map((n) => ({name: n, color: machineColor(n), points: historyData.machines[n].map((p) => [p[0], p[idx]])}));
+  drawLineChart("chart-cpu", "legend-cpu", machineSeries(1), 100, "%");
+  drawLineChart("chart-ram", "legend-ram", machineSeries(2), 100, "%");
+  const bots = historyData.bots;
+  const top = niceMax(Math.max(1, ...bots.map((p) => p[1])));
+  drawLineChart("chart-bots", "legend-bots", [
+    {name: "running", color: "var(--series-1)", points: bots.map((p) => [p[0], p[1]])},
+    {name: "playing", color: "var(--series-3)", points: bots.map((p) => [p[0], p[2]])},
+  ], top, "");
+  const first = Math.min(...bots.map((p) => p[0]));
+  $("history-note").textContent = bots.length ? "since " + clock(first) + " · every 5s" : "";
+}
+
+/* ---------- Screenshot modal ---------- */
+let shotBot = null, shotTimer = null;
+async function openShot(botId) {
+  const b = state.bots.find((x) => x.id === botId);
+  shotBot = botId;
+  $("shot-title").textContent = `Screenshot · #${botId} ${b ? b.name : ""}`;
+  $("shot-body").innerHTML = '<div class="wait">Asking the bot for a picture…</div>';
+  $("shot-caption").textContent = "";
+  $("shot-modal").classList.add("show");
+  const asked = now();
+  await command({action: "screenshot", bot: botId}, "Screenshot requested");
+  clearInterval(shotTimer);
+  shotTimer = setInterval(async () => {
+    if (shotBot !== botId) return clearInterval(shotTimer);
+    if (now() - asked > 45) {
+      clearInterval(shotTimer);
+      $("shot-body").innerHTML = '<div class="wait">No picture yet — the bot only answers between page loads. Try again in a moment.</div>';
+      return;
+    }
+    let shot;
+    try { shot = await getJSON("/api/screenshot?bot=" + botId); } catch (e) { return; }
+    if (shot.time >= asked - 1) {
+      clearInterval(shotTimer);
+      $("shot-body").innerHTML = `<img alt="Screen of bot ${botId}" src="data:image/jpeg;base64,${shot.data}">`;
+      $("shot-caption").textContent = `Taken ${clockSec(shot.time)} on ${shot.machine}`;
+    }
+  }, 1000);
+}
+function closeShot() { shotBot = null; clearInterval(shotTimer); $("shot-modal").classList.remove("show"); }
+
+/* ---------- Main refresh ---------- */
 async function refresh() {
   try {
-    const res = await fetch("/api/state", {cache: "no-store"});
-    if (!res.ok) throw new Error(res.status);
-    const data = await res.json();
+    const data = await getJSON("/api/state");
     if (!data.time) throw new Error("coordinator still starting");
     state = data;
     serverOffset = state.time - Date.now() / 1000;
     $("conn").classList.add("ok");
     $("conn-text").textContent = "live · updated " + new Date().toLocaleTimeString();
-    renderTiles(); renderMachines(); renderBots(); renderProxies(); renderEvents(); renderRotation();
+    renderAlerts(); renderTiles(); renderMachines(); renderBots(); renderProxies(); renderEvents(); renderRotation();
+    fillSettings(false); syncLogFilters();
   } catch (e) {
     $("conn").classList.remove("ok");
     $("conn-text").textContent = "no data (" + e.message + ")";
   }
 }
 
+/* ---------- Events ---------- */
 document.addEventListener("click", (e) => {
   const btn = e.target.closest("button");
-  if (!btn) return;
+  if (!btn || btn.disabled) return;
+  if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
   if (btn.dataset.action) {
     if (btn.dataset.action === "stop_all" && !confirm("Stop every bot?")) return;
     command({action: btn.dataset.action}, btn.textContent.trim());
   } else if (btn.dataset.cmd) {
     command(JSON.parse(btn.dataset.cmd), btn.textContent.trim());
+  } else if (btn.dataset.bulk) {
+    const bots = [...selected].sort((a, b) => a - b);
+    if (btn.dataset.bulk === "stop_bots" && !confirm(`Stop ${bots.length} bots?`)) return;
+    command({action: btn.dataset.bulk, bots}, `${btn.textContent.trim()}: ${bots.length} bots`);
+  } else if (btn.id === "bulk-clear") {
+    selected.clear(); renderBots();
+  } else if (btn.dataset.shot !== undefined) {
+    openShot(Number(btn.dataset.shot));
+  } else if (btn.dataset.dismiss !== undefined) {
+    dismissed.set(btn.dataset.dismiss, btn.dataset.text); renderAlerts();
   } else if (btn.dataset.setMax !== undefined) {
     const input = document.querySelector(`input[data-max-for="${CSS.escape(btn.dataset.setMax)}"]`);
     const value = input.value === "" ? null : Number(input.value);
@@ -332,14 +673,53 @@ document.addEventListener("click", (e) => {
     const groups = Number($("groups-input").value);
     if (groups >= 1 && groups <= 50) command({action: "set_groups", groups}, "Groups set to " + groups);
     editingGroups = false;
+  } else if (btn.id === "shot-close") {
+    closeShot();
+  } else if (btn.id === "shot-again" && shotBot != null) {
+    openShot(shotBot);
+  } else if (btn.id === "settings-reset" && state) {
+    fillSettings(true);
   }
 });
+document.addEventListener("change", (e) => {
+  if (e.target.dataset && e.target.dataset.select !== undefined) {
+    const id = Number(e.target.dataset.select);
+    e.target.checked ? selected.add(id) : selected.delete(id);
+    e.target.closest("tr").classList.toggle("selected", e.target.checked);
+    renderBulk();
+  } else if (e.target.id === "select-all" && state) {
+    if (e.target.checked) state.bots.forEach((b) => selected.add(b.id)); else selected.clear();
+    renderBots();
+  } else if (["log-machine", "log-bot", "log-level"].includes(e.target.id)) {
+    $("logs").scrollTop = $("logs").scrollHeight;
+    refreshLogs();
+  }
+});
+$("settings-form").addEventListener("input", () => settingsDirty = true);
+$("settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {
+    action: "set_settings",
+    room: $("set-room").value.trim(),
+    bots_per_proxy: Number($("set-bpp").value),
+    proxy_check_interval: Number($("set-check").value),
+    stagger_interval: Number($("set-stagger").value),
+  };
+  const restarts = state && (body.room !== state.settings.room || body.bots_per_proxy !== state.settings.bots_per_proxy);
+  if (restarts && !confirm("Changing the room or bots per group restarts the bots. Continue?")) return;
+  if (await command(body, "Settings saved")) settingsDirty = false;
+});
+$("shot-modal").addEventListener("click", (e) => { if (e.target.id === "shot-modal") closeShot(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeShot(); });
 $("groups-input").addEventListener("focus", () => editingGroups = true);
 $("groups-input").addEventListener("blur", () => setTimeout(() => editingGroups = false, 300));
+window.addEventListener("resize", () => { clearTimeout(drawCharts.t); drawCharts.t = setTimeout(drawCharts, 150); });
 
-refresh();
+refresh().then(() => { refreshLogs(); refreshHistory(); });
 setInterval(refresh, 2000);
 setInterval(renderRotation, 1000);
+setInterval(refreshLogs, 3000);
+setInterval(refreshHistory, 10000);
 </script>
 </body>
 </html>

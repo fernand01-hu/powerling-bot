@@ -22,6 +22,7 @@ import queue
 import multiprocessing.connection
 import os
 import random
+import re
 import signal
 import sys
 import threading
@@ -82,6 +83,8 @@ class WebshareManager:
         self.api_key = api_key
         self.proxies: List[Dict[str, str]] = []
         self.list_created_at: Optional[float] = None  # When Webshare issued the current list
+        self.last_success: Optional[float] = None  # Last time the list was read without error
+        self.last_error: Optional[str] = None
         self.refresh_frequency: Optional[float] = None  # Seconds between Webshare's automatic rotations
 
     def _get(self, url: str) -> dict:
@@ -131,7 +134,10 @@ class WebshareManager:
                 url = data.get("next")
         except Exception as e:
             logger.warning(f"[Webshare] Failed to fetch proxies: {e}")
+            self.last_error = str(e)
             return self.proxies
+        self.last_success = time.time()
+        self.last_error = None
         if created:
             try:
                 self.list_created_at = max(
@@ -155,6 +161,11 @@ DEFAULT_WAIT_AGENTS = 15.0  # Seconds to let remote agents connect before placin
 DEFAULT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".config", "powerline-bot", "state.json")
 AGENT_TIMEOUT = 30.0       # An agent silent this long (it reports every HEALTH_INTERVAL) counts as gone
 MIN_REFETCH_INTERVAL = 15.0  # Seconds between extra Webshare refreshes triggered by proxy failures
+HISTORY_POINTS = 720       # One hour of history at one sample every HEALTH_INTERVAL (5s)
+MACHINE_LOG_LINES = 400    # Recent log lines kept per machine for the dashboard
+ALERT_MEMORY = 600.0       # Seconds a past event (e.g. a machine disconnecting) stays in the alerts
+FAILING_STREAK = 3         # Exits in a row that make a bot show up in the alerts
+ROOM_PATTERN = re.compile(r"^[A-Za-z0-9]{1,16}$")
 HEALTHY_RUN = 120.0        # A bot that ran this long before exiting has its restart backoff reset
 
 
@@ -216,7 +227,7 @@ class RemoteAgent:
                 self.last_seen = time.time()
                 if msg["type"] == "health":
                     self.last_health = msg
-                elif msg["type"] == "exited":
+                elif msg["type"] in ("exited", "screenshot"):
                     self.events.append(msg)
         except (OSError, EOFError, ValueError):
             self.alive = False
@@ -237,6 +248,12 @@ class RemoteAgent:
     def stop_all(self):
         self.send({"type": "stop_all"})
 
+    def request_screenshot(self, bot_id: int):
+        self.send({"type": "screenshot", "bot": bot_id})
+
+    def restart(self):
+        self.send({"type": "restart"})
+
     def poll(self) -> List[dict]:
         self.receive()
         events, self.events = self.events, []
@@ -253,6 +270,9 @@ class RemoteAgent:
 class Coordinator:
     def __init__(self, args: argparse.Namespace, agents: List, state_file: Optional[str] = None):
         self.args = args
+        for key, default in (("proxy_check_interval", DEFAULT_PROXY_CHECK_INTERVAL), ("stagger_interval", DEFAULT_STAGGER_INTERVAL)):
+            if not hasattr(args, key):
+                setattr(args, key, default)
         self.agents = list(agents)  # Agent (this machine) and RemoteAgent (other machines)
         self.proxy_mgr = WebshareManager(api_key=args.webshare_key)
         self.group_proxies: List[Dict[str, str]] = []
@@ -280,6 +300,13 @@ class Coordinator:
         self.last_health: Dict[int, dict] = {}  # id(agent) -> latest health report
         self.events: deque = deque(maxlen=60)  # Recent coordinator log lines for the dashboard
         self.snapshot: dict = {}
+        self.machine_logs: Dict[str, deque] = {}  # Machine name -> its agent's and bots' recent log lines
+        self.screenshots: Dict[int, dict] = {}    # Bot id -> latest {"time", "data"} (base64 JPEG)
+        self.history: Dict[str, deque] = {}       # Machine name -> [time, cpu %, ram %] samples
+        self.bot_history: deque = deque(maxlen=HISTORY_POINTS)  # [time, running, playing]
+        self.recent_alerts: deque = deque(maxlen=50)  # Past events worth an alert: {"time", "key", "level", "text"}
+        self.next_proxy_check = 0.0
+        self.data_lock = threading.Lock()  # Guards logs/history, which the web server thread reads
         events_handler = logging.Handler()
         events_handler.emit = lambda record: self.events.append(
             {"time": record.created, "level": record.levelname, "message": record.getMessage()}
@@ -301,6 +328,18 @@ class Coordinator:
         except (OSError, ValueError) as e:
             logger.warning(f"[Coordinator] Couldn't read {self.state_file} ({e}); starting fresh.")
             return
+        settings = state.get("settings", {})
+        if isinstance(settings.get("room"), str) and ROOM_PATTERN.match(settings["room"]):
+            self.args.room = settings["room"]
+        if isinstance(settings.get("groups"), int) and 1 <= settings["groups"] <= 50:
+            self.groups = settings["groups"]
+        if isinstance(settings.get("bots_per_proxy"), int) and 1 <= settings["bots_per_proxy"] <= 10:
+            self.args.bots_per_proxy = settings["bots_per_proxy"]
+        for key, low, high in (("proxy_check_interval", 15, 3600), ("stagger_interval", 0, 60)):
+            if isinstance(settings.get(key), (int, float)) and low <= settings[key] <= high:
+                setattr(self.args, key, float(settings[key]))
+        while len(self.nicknames) < self.total:
+            self.nicknames.append(generate_random_nickname())
         names = [n for n in state.get("nicknames", []) if isinstance(n, str)]
         self.nicknames[:len(names)] = names[:len(self.nicknames)]
         self.paused = set(state.get("paused", []))
@@ -316,6 +355,13 @@ class Coordinator:
             "paused": sorted(self.paused),
             "stopped": sorted(self.stopped),
             "max_bots": self.saved_max,
+            "settings": {
+                "room": self.args.room,
+                "groups": self.groups,
+                "bots_per_proxy": self.args.bots_per_proxy,
+                "proxy_check_interval": getattr(self.args, "proxy_check_interval", DEFAULT_PROXY_CHECK_INTERVAL),
+                "stagger_interval": self.args.stagger_interval,
+            },
         }
         try:
             os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
@@ -397,6 +443,13 @@ class Coordinator:
         with self.joined_lock:
             joined, self.joined = self.joined, []
         for agent in joined:
+            # The same machine reconnecting (e.g. after "Restart agent") replaces its old, stale link.
+            stale = [a for a in self.agents if isinstance(a, RemoteAgent) and a.name == agent.name]
+            for old in stale:
+                old.alive = False
+                old.conn.close()
+            if stale:
+                self.drop_dead_agents()
             self.agents.append(agent)
             self.apply_saved_limit(agent)
             health = agent.last_health
@@ -416,6 +469,8 @@ class Coordinator:
             self.last_health.pop(id(agent), None)
             orphans = sorted(b for b, a in self.bot_agent.items() if a is agent)
             logger.warning(f"[Coordinator] Agent {agent.name} disconnected; re-placing its bots {orphans}.")
+            self.recent_alerts.append({"time": time.time(), "key": f"left:{agent.name}", "level": "warning",
+                                       "text": f"Machine {agent.name} disconnected"})
             for bot_id in orphans:
                 del self.bot_agent[bot_id]
                 self.pending[bot_id] = random.uniform(1.0, 3.5)
@@ -436,6 +491,18 @@ class Coordinator:
             for bot_id, status in health.get("bot_status", {}).items():
                 if self.bot_agent.get(int(bot_id)) is agent:
                     self.bot_status[int(bot_id)] = status
+            mem_total = health.get("mem_total_mb") or 0
+            mem_used = 100.0 * (1 - health.get("mem_available_mb", 0) / mem_total) if mem_total else 0.0
+            with self.data_lock:
+                log = self.machine_logs.setdefault(agent.name, deque(maxlen=MACHINE_LOG_LINES))
+                for line in health.get("logs", []):
+                    log.append(dict(line, machine=agent.name))
+                self.history.setdefault(agent.name, deque(maxlen=HISTORY_POINTS)).append(
+                    [round(time.time(), 1), round(health["cpu_percent"], 1), round(mem_used, 1)]
+                )
+        playing = sum(1 for b, st in self.bot_status.items() if st.get("state") == "playing" and b in self.bot_agent)
+        with self.data_lock:
+            self.bot_history.append([round(time.time(), 1), len(self.bot_agent), playing])
 
     def agent_stats(self) -> List[dict]:
         stats = []
@@ -534,6 +601,9 @@ class Coordinator:
         for agent in list(self.agents):
             for event in agent.poll():
                 bot_id = event["bot"]
+                if event.get("type") == "screenshot":
+                    self.screenshots[bot_id] = {"time": event["time"], "data": event["data"], "machine": agent.name}
+                    continue
                 if self.bot_agent.get(bot_id) is not agent:
                     continue  # Already moved or re-placed
                 del self.bot_agent[bot_id]
@@ -604,20 +674,88 @@ class Coordinator:
             self.groups = groups
             self.group_proxies = self.group_proxies[:groups]
 
+    def valid_bots(self, value) -> List[int]:
+        """Bot ids from a command: one int or a list of ints, keeping only existing bots."""
+        ids = value if isinstance(value, list) else [value]
+        return sorted({b for b in ids[:500] if isinstance(b, int) and not isinstance(b, bool) and 0 <= b < self.total})
+
+    def stop_bot_ids(self, bot_ids: List[int]):
+        self.unplace(bot_ids)
+        self.stopped.update(bot_ids)
+
+    def start_bot_ids(self, bot_ids: List[int]):
+        self.unplace(bot_ids)
+        for i, bot_id in enumerate(bot_ids):
+            self.stopped.discard(bot_id)
+            self.failures[bot_id] = 0
+            self.place_bot(bot_id, i * self.args.stagger_interval + random.uniform(1.0, 3.5))
+
+    def apply_settings(self, cmd: dict):
+        room = cmd.get("room", self.args.room)
+        bpp = cmd.get("bots_per_proxy", self.args.bots_per_proxy)
+        check = cmd.get("proxy_check_interval", self.args.proxy_check_interval)
+        stagger = cmd.get("stagger_interval", self.args.stagger_interval)
+        if not (isinstance(room, str) and ROOM_PATTERN.match(room)):
+            raise ValueError(f"room must be 1-16 letters or digits, got {room!r}")
+        if not (isinstance(bpp, int) and not isinstance(bpp, bool) and 1 <= bpp <= 10):
+            raise ValueError(f"bots per group must be 1-10, got {bpp!r}")
+        if not (isinstance(check, (int, float)) and 15 <= check <= 3600):
+            raise ValueError(f"proxy check interval must be 15-3600s, got {check!r}")
+        if not (isinstance(stagger, (int, float)) and 0 <= stagger <= 60):
+            raise ValueError(f"stagger must be 0-60s, got {stagger!r}")
+        self.args.proxy_check_interval = float(check)
+        self.next_proxy_check = min(self.next_proxy_check, time.time() + self.args.proxy_check_interval)
+        self.args.stagger_interval = float(stagger)
+        if room != self.args.room or bpp != self.args.bots_per_proxy:
+            running = sorted(set(range(self.total)) - self.stopped)
+            logger.info(f"[Coordinator] Dashboard: room #{room}, {bpp} bots per group; restarting the bots.")
+            self.unplace(list(range(self.total)))
+            old_total = self.total
+            self.args.room = room
+            self.args.bots_per_proxy = bpp
+            while len(self.nicknames) < self.total:
+                self.nicknames.append(generate_random_nickname())
+            # Bots beyond the old total are new; they start unless everything was stopped.
+            self.stopped = {b for b in self.stopped if b < self.total}
+            if not running and old_total:
+                self.stopped = set(range(self.total))
+            self.start_bot_ids([b for b in range(self.total) if b not in self.stopped])
+        logger.info(
+            f"[Coordinator] Dashboard: settings saved (room #{room}, {bpp} bots per group, "
+            f"proxy check every {check:.0f}s, stagger {stagger:.1f}s)."
+        )
+
     def run_command(self, cmd: dict):
         """Apply one dashboard command (runs in the main loop, never in the web server thread)."""
         action = cmd.get("action")
         bot_id = cmd.get("bot")
-        if action == "stop_bot" and isinstance(bot_id, int) and 0 <= bot_id < self.total:
-            logger.info(f"[Coordinator] Dashboard: stopping bot #{bot_id} '{self.nicknames[bot_id]}'.")
-            self.unplace([bot_id])
-            self.stopped.add(bot_id)
-        elif action in ("start_bot", "restart_bot") and isinstance(bot_id, int) and 0 <= bot_id < self.total:
-            logger.info(f"[Coordinator] Dashboard: {'re' if action == 'restart_bot' else ''}starting bot #{bot_id}.")
-            self.unplace([bot_id])
-            self.stopped.discard(bot_id)
-            self.failures[bot_id] = 0
-            self.place_bot(bot_id, random.uniform(1.0, 3.5))
+        bots = self.valid_bots(cmd.get("bots", bot_id))
+        if action in ("stop_bot", "stop_bots") and bots:
+            logger.info(f"[Coordinator] Dashboard: stopping bot{'s' if len(bots) > 1 else ''} {', '.join('#%d' % b for b in bots)}.")
+            self.stop_bot_ids(bots)
+        elif action in ("start_bot", "restart_bot", "start_bots", "restart_bots") and bots:
+            verb = "restarting" if action.startswith("restart") else "starting"
+            logger.info(f"[Coordinator] Dashboard: {verb} bot{'s' if len(bots) > 1 else ''} {', '.join('#%d' % b for b in bots)}.")
+            self.start_bot_ids(bots)
+        elif action == "screenshot" and bots:
+            agent = self.bot_agent.get(bots[0])
+            if agent is None:
+                raise ValueError(f"bot #{bots[0]} isn't running")
+            agent.request_screenshot(bots[0])
+        elif action in ("restart_machine", "stop_machine_bots") and self.agent_by_name(cmd.get("machine", "")):
+            agent = self.agent_by_name(cmd["machine"])
+            its_bots = sorted(b for b, a in self.bot_agent.items() if a is agent)
+            if action == "stop_machine_bots":
+                logger.info(f"[Coordinator] Dashboard: stopping the bots on {agent.name} {its_bots}.")
+                self.stop_bot_ids(its_bots)
+            elif isinstance(agent, RemoteAgent):
+                logger.info(f"[Coordinator] Dashboard: restarting the agent on {agent.name}; its bots move meanwhile.")
+                agent.restart()  # It disconnects; its bots are re-placed and it rejoins after restarting
+            else:
+                logger.info(f"[Coordinator] Dashboard: restarting the bots on {agent.name} (the coordinator's own machine).")
+                self.start_bot_ids(its_bots)
+        elif action == "set_settings":
+            self.apply_settings(cmd)
         elif action == "stop_all":
             logger.info("[Coordinator] Dashboard: stopping all bots.")
             self.unplace(list(range(self.total)))
@@ -753,7 +891,69 @@ class Coordinator:
             "next_rotation": self.proxy_mgr.next_rotation(now),
             "last_fetch": self.last_fetch,
             "events": list(self.events),
+            "alerts": self.alerts(now),
+            "settings": {
+                "room": self.args.room,
+                "groups": self.groups,
+                "bots_per_proxy": bpp,
+                "proxy_check_interval": self.args.proxy_check_interval,
+                "stagger_interval": self.args.stagger_interval,
+            },
+            "screenshot_times": {str(b): shot["time"] for b, shot in self.screenshots.items()},
         }
+
+    def alerts(self, now: float) -> List[dict]:
+        """Problems worth a banner on the dashboard."""
+        alerts = []
+        if not self.agents:
+            alerts.append({"key": "no-machines", "level": "error", "text": "No machine is connected, so no bot can run"})
+        stats = self.agent_stats()
+        for agent, st in zip(self.agents, stats):
+            if st["full_window"] and st["cpu"] >= OVERLOAD_CPU:
+                alerts.append({"key": f"hot:{agent.name}", "level": "warning",
+                               "text": f"{agent.name} is overloaded ({st['cpu']:.0f}% CPU over 30s)"})
+        waiting = sorted(b for b in self.pending if b not in self.stopped)
+        if waiting:
+            alerts.append({"key": "waiting", "level": "warning",
+                           "text": f"{len(waiting)} bot(s) waiting for a machine with room"})
+        failing = [b for b in range(self.total) if self.failures.get(b, 0) >= FAILING_STREAK and b not in self.stopped]
+        if failing:
+            names = ", ".join(self.nicknames[b] for b in failing[:5]) + ("…" if len(failing) > 5 else "")
+            alerts.append({"key": "failing", "level": "warning",
+                           "text": f"{len(failing)} bot(s) keep failing: {names}"})
+        if self.proxy_mgr.proxies and all(self.bad_until.get(proxy_key(p), 0) > now for p in self.proxy_mgr.proxies):
+            alerts.append({"key": "all-benched", "level": "error",
+                           "text": "Every proxy is benched: none could reach the game"})
+        last_ok = self.proxy_mgr.last_success or 0
+        if self.proxy_mgr.last_error and now - last_ok > 3 * self.args.proxy_check_interval:
+            alerts.append({"key": "webshare", "level": "error",
+                           "text": f"Webshare isn't answering ({self.proxy_mgr.last_error[:80]})"})
+        current = {a.name for a in self.agents}
+        for past in self.recent_alerts:
+            name = past["key"].split(":", 1)[1]
+            if now - past["time"] < ALERT_MEMORY and name not in current:
+                alerts.append({"key": past["key"], "level": past["level"],
+                               "text": past["text"] + f" {int((now - past['time']) // 60)} min ago"})
+        return alerts
+
+    def logs_view(self, machine: Optional[str] = None, bot: Optional[int] = None, limit: int = 200) -> List[dict]:
+        """Recent log lines for the dashboard, newest last, optionally for one machine and/or bot."""
+        with self.data_lock:
+            sources = [self.machine_logs[machine]] if machine in self.machine_logs else (
+                [] if machine else list(self.machine_logs.values()))
+            lines = [line for log in sources for line in log if bot is None or line.get("bot") == bot]
+        lines.sort(key=lambda line: line["time"])
+        return lines[-max(1, min(limit, 1000)):]
+
+    def history_view(self) -> dict:
+        with self.data_lock:
+            return {
+                "machines": {name: list(points) for name, points in self.history.items()},
+                "bots": list(self.bot_history),
+            }
+
+    def screenshot_view(self, bot_id: int) -> Optional[dict]:
+        return self.screenshots.get(bot_id)
 
     def shutdown(self, *_):
         logger.info("[Coordinator] Shutting down all bots...")
@@ -770,11 +970,11 @@ class Coordinator:
         while not self.proxy_mgr.fetch_proxies():
             logger.error("[Coordinator] No proxies available from Webshare, retrying in 30s...")
             time.sleep(30)
-        if len(self.proxy_mgr.proxies) < args.groups:
+        if len(self.proxy_mgr.proxies) < self.groups:
             logger.warning(
-                f"[Coordinator] Only {len(self.proxy_mgr.proxies)} proxies for {args.groups} groups; some groups share an IP."
+                f"[Coordinator] Only {len(self.proxy_mgr.proxies)} proxies for {self.groups} groups; some groups share an IP."
             )
-        self.group_proxies = reassign_proxies([None] * args.groups, self.proxy_mgr.proxies)
+        self.group_proxies = reassign_proxies([None] * self.groups, self.proxy_mgr.proxies)
         self.proxy_mgr.fetch_refresh_frequency()
 
         signal.signal(signal.SIGINT, self.shutdown)
@@ -788,7 +988,7 @@ class Coordinator:
         self.add_joined_agents()
         self.refresh_health()
 
-        for g in range(args.groups):
+        for g in range(self.groups):
             proxy = self.group_proxies[g]
             logger.info(f"[Coordinator] Group {g} on {proxy['host']}:{proxy['port']} ({args.bots_per_proxy} bots)")
             if start_stopped:
@@ -801,14 +1001,14 @@ class Coordinator:
         self.save_state()
 
         self.last_fetch = time.time()
-        next_proxy_check = time.time() + args.proxy_check_interval
+        self.next_proxy_check = time.time() + args.proxy_check_interval
         while True:
             self.add_joined_agents()
             self.drop_dead_agents()
             self.refresh_health()
-            if time.time() >= next_proxy_check:
+            if time.time() >= self.next_proxy_check:
                 self.check_proxies()
-                next_proxy_check = time.time() + args.proxy_check_interval
+                self.next_proxy_check = time.time() + self.args.proxy_check_interval
             self.handle_exits()
             self.run_commands()
             self.place_pending()

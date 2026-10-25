@@ -74,7 +74,15 @@ If the connection drops, an agent stops its bots and reconnects every 5s, so eit
 
 ## Dashboard
 
-The coordinator can serve a password-protected web page showing every bot (state: loading / connecting / lobby / playing / dead, machine, group, IP, rounds, last respawn time), every machine (CPU, RAM, bots), the proxies and a countdown to Webshare's next IP rotation, plus a feed of recent events. From it you can stop, start or restart a bot, stop or start all bots, pause a machine (its bots move elsewhere) or resume it, set a machine's bot limit, change the number of groups, and refresh the proxy list.
+The coordinator can serve a password-protected web page for running everything:
+
+- **Overview**: every bot (state: loading / connecting / lobby / playing / dead, machine, group, IP, rounds, last respawn time), every machine (CPU, RAM, bots), the proxies and a countdown to Webshare's next IP rotation.
+- **Alerts**: a banner when a machine disconnects or is overloaded, bots wait for room or keep failing, every proxy is benched, or Webshare stops answering.
+- **Bots**: stop, start or restart one bot, a selection (checkboxes) or all of them; 📷 shows what a bot's browser currently displays.
+- **Machines**: pause/resume (its bots move elsewhere), bot limit, restart its agent (also loads updated code), stop its bots.
+- **Last hour**: CPU and RAM per machine and bots running/playing, as charts (hover for values).
+- **Live logs** from every machine and bot, filterable by machine, bot and level, plus the coordinator's own events.
+- **Settings**: room code, bots per group, proxy check interval and join stagger; saved and kept after a restart (changing the room or bots per group restarts the bots). Groups can be changed under Proxies.
 
 ```bash
 export POWERLINE_DASHBOARD_PASSWORD=choose-a-password

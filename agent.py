@@ -28,11 +28,14 @@ import signal
 import sys
 import tempfile
 import time
+from collections import deque
 from typing import Callable, Dict, List, Optional, Tuple
 
 import psutil
 
-from bot import BAD_PROXY_EXIT, IS_WINDOWS, STOP_WORKER, bot_worker_process, kill_processes, process_tree
+from bot import (
+    BAD_PROXY_EXIT, IS_WINDOWS, SCREENSHOT_REQUEST, STOP_WORKER, bot_worker_process, kill_processes, process_tree,
+)
 
 logger = logging.getLogger("PowerlineBot.Agent")
 
@@ -41,6 +44,8 @@ HEALTH_INTERVAL = 5.0     # Seconds between health reports to the coordinator
 RECONNECT_DELAY = 5.0     # Seconds between attempts to reach the coordinator
 AGENT_KEY_ENV = "POWERLINE_AGENT_KEY"
 MAX_MESSAGE = 1_000_000   # Bytes; anything bigger is refused
+LOG_BUFFER = 500          # Recent log lines kept per agent (its own and its bots')
+MAX_LOGS_PER_REPORT = 200  # Log lines sent per health report
 
 
 def send_msg(conn: multiprocessing.connection.Connection, msg: dict):
@@ -99,6 +104,15 @@ class Agent:
         self.reports = multiprocessing.Queue()  # Workers say which proxy failed before exiting
         self.failed_proxies: Dict[int, Dict[str, str]] = {}  # Reports waiting for their worker's exit
         self.bot_status: Dict[int, dict] = {}  # Latest status each bot reported (for the dashboard)
+        self.events: List[dict] = []  # Screenshots waiting to be passed on by poll()
+        # Recent log lines for the dashboard; health() sends the ones not sent yet.
+        self.logs: deque = deque(maxlen=LOG_BUFFER)
+        self.log_seq = 0
+        self.logs_sent = 0
+        self.restart_requested = False
+        self.log_handler = logging.Handler(level=logging.INFO)
+        self.log_handler.emit = self._capture_own_log
+        logger.addHandler(self.log_handler)
         if debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
         psutil.cpu_percent()  # Prime the counter; the first reading is always 0
@@ -184,7 +198,7 @@ class Agent:
         For a bad-proxy exit, "proxy" is the proxy the worker was actually using."""
         self._drain_reports()
         self.finish_stopping()
-        events = []
+        events, self.events = self.events, []
         for bot_id, (p, _, home) in list(self.workers.items()):
             if p.is_alive():
                 continue
@@ -209,11 +223,36 @@ class Agent:
             })
         return events
 
+    def _capture_own_log(self, record: logging.LogRecord):
+        message = record.getMessage()
+        if message.startswith(f"[Agent {self.name}]"):  # Not another Agent's lines in the same process
+            self.add_log(None, record.created, record.levelname, message)
+
+    def add_log(self, bot_id: Optional[int], when: float, level: str, message: str):
+        self.log_seq += 1
+        self.logs.append({"seq": self.log_seq, "bot": bot_id, "time": when, "level": level, "message": message})
+
+    def new_logs(self) -> List[dict]:
+        """Log lines not yet sent to the coordinator (the newest ones if there are too many)."""
+        fresh = [line for line in self.logs if line["seq"] > self.logs_sent][-MAX_LOGS_PER_REPORT:]
+        self.logs_sent = self.log_seq
+        return fresh
+
+    def request_screenshot(self, bot_id: int):
+        entry = self.workers.get(bot_id)
+        if entry and entry[0].is_alive():
+            entry[1].put(SCREENSHOT_REQUEST)
+
     def _file_report(self, report: dict):
         if "bad_proxy" in report:
             self.failed_proxies[report["bot"]] = report["bad_proxy"]
         elif "status" in report and report["bot"] in self.workers:
             self.bot_status[report["bot"]] = report["status"]
+        elif "log" in report:
+            line = report["log"]
+            self.add_log(report["bot"], line.get("time", time.time()), line.get("level", "INFO"), str(line.get("message", "")))
+        elif "screenshot" in report and report["bot"] in self.workers:
+            self.events.append({"type": "screenshot", "bot": report["bot"], "data": report["screenshot"], "time": report["time"]})
 
     def _drain_reports(self):
         while True:
@@ -237,6 +276,7 @@ class Agent:
             "mem_total_mb": mem.total // (1024 * 1024),
             "platform": platform.system(),
             "bot_status": {str(b): st for b, st in self.bot_status.items()},
+            "logs": self.new_logs(),
         }
 
     def handle(self, msg: dict):
@@ -251,6 +291,11 @@ class Agent:
             self.stop_all()
         elif msg["type"] == "set_max_bots":
             self.max_bots = msg["max_bots"]
+        elif msg["type"] == "screenshot":
+            self.request_screenshot(msg["bot"])
+        elif msg["type"] == "restart":
+            logger.info(f"[Agent {self.name}] Restart requested by the coordinator.")
+            self.restart_requested = True
         elif msg["type"] == "rejected":
             logger.error(f"[Agent {self.name}] Coordinator refused this agent: {msg['reason']}")
             sys.exit(1)
@@ -260,7 +305,7 @@ def serve(conn: multiprocessing.connection.Connection, agent: Agent):
     """Serve one coordinator connection until it drops."""
     send_msg(conn, {"type": "hello", "version": code_version(), **agent.health()})
     next_health = time.time() + HEALTH_INTERVAL
-    while True:
+    while not agent.restart_requested:
         if conn.poll(0.5):
             agent.handle(recv_msg(conn))
         for event in agent.poll():
@@ -268,6 +313,16 @@ def serve(conn: multiprocessing.connection.Connection, agent: Agent):
         if time.time() >= next_health:
             send_msg(conn, {"type": "health", **agent.health()})
             next_health = time.time() + HEALTH_INTERVAL
+
+
+def restart_process():
+    """Start this agent afresh (which also loads updated code)."""
+    logger.info("[Agent] Restarting...")
+    logging.shutdown()
+    if IS_WINDOWS:
+        # os.execv on Windows starts a separate process; start-agent.cmd's loop restarts us instead.
+        sys.exit(0)
+    os.execv(sys.executable, [sys.executable] + sys.argv)  # Same PID, so systemd keeps tracking it
 
 
 def run_agent(address: Tuple[str, int], key: bytes, agent: Agent):
@@ -288,6 +343,10 @@ def run_agent(address: Tuple[str, int], key: bytes, agent: Agent):
         logger.info(f"[Agent {agent.name}] Connected to coordinator at {address[0]}:{address[1]}.")
         try:
             serve(conn, agent)
+            if agent.restart_requested:
+                agent.stop_all(wait=True)
+                conn.close()
+                restart_process()
         except (EOFError, OSError, ValueError):
             logger.warning(f"[Agent {agent.name}] Lost the coordinator; stopping bots until it's back.")
             agent.stop_all(wait=True)

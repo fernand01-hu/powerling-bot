@@ -3,6 +3,9 @@ Dashboard: a small password-protected website served by the coordinator.
 
 - GET  /            the dashboard page (dashboard.html)
 - GET  /api/state   everything it shows, as JSON (the coordinator's latest snapshot)
+- GET  /api/logs?machine=NAME&bot=N&limit=200   recent log lines from the machines
+- GET  /api/history  CPU/RAM per machine and bots running/playing, for the last hour
+- GET  /api/screenshot?bot=N   the latest screenshot a bot sent (base64 JPEG)
 - POST /api/command a control action; queued and carried out by the coordinator's main loop
 
 The password comes from $POWERLINE_DASHBOARD_PASSWORD (any user name works). Command
@@ -18,7 +21,15 @@ import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Tuple
+from typing import Optional, Tuple
+from urllib.parse import parse_qs, urlparse
+
+
+def int_param(query: dict, name: str) -> Optional[int]:
+    try:
+        return int(query[name][0])
+    except (KeyError, IndexError, ValueError):
+        return None
 
 logger = logging.getLogger("PowerlineBot.Dashboard")
 
@@ -27,7 +38,9 @@ DASHBOARD_PASSWORD_ENV = "POWERLINE_DASHBOARD_PASSWORD"
 PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 ACTIONS = {
     "stop_bot", "start_bot", "restart_bot", "stop_all", "start_all",
-    "pause_machine", "resume_machine", "set_max_bots", "set_groups", "refresh_proxies",
+    "stop_bots", "start_bots", "restart_bots", "screenshot",
+    "pause_machine", "resume_machine", "set_max_bots", "restart_machine", "stop_machine_bots",
+    "set_groups", "set_settings", "refresh_proxies",
 }
 MAX_BODY = 4096
 
@@ -69,11 +82,23 @@ def make_handler(coordinator, password: str):
         def do_GET(self):
             if not self.authorized():
                 return
-            if self.path == "/":
+            url = urlparse(self.path)
+            query = parse_qs(url.query)
+            if url.path == "/":
                 with open(PAGE_PATH, "rb") as f:
                     self.send_body(200, f.read(), "text/html; charset=utf-8")
-            elif self.path == "/api/state":
+            elif url.path == "/api/state":
                 self.send_json(200, coordinator.snapshot)
+            elif url.path == "/api/logs":
+                machine = query.get("machine", [None])[0] or None
+                limit = int_param(query, "limit") or 200
+                self.send_json(200, coordinator.logs_view(machine=machine, bot=int_param(query, "bot"), limit=limit))
+            elif url.path == "/api/history":
+                self.send_json(200, coordinator.history_view())
+            elif url.path == "/api/screenshot":
+                bot = int_param(query, "bot")
+                shot = coordinator.screenshot_view(bot) if bot is not None else None
+                self.send_json(200 if shot else 404, shot or {"error": "no screenshot yet"})
             else:
                 self.send_json(404, {"error": "not found"})
 

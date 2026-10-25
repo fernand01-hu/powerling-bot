@@ -64,11 +64,13 @@ class FakePage:
             raise self.goto_error
 
     def wait_for_selector(self, selector, **_):
-        if not self.lobby_appears:
+        self.waits = getattr(self, "waits", 0) + 1
+        if not self.lobby_appears or self.waits <= getattr(self, "lobby_after", 0):
             raise TimeoutError(selector)
 
-    def screenshot(self, path):
+    def screenshot(self, path=None, **_):
         self.screenshots.append(path)
+        return b"\xff\xd8fake-jpeg"
 
     def keys_pressed(self) -> List[str]:
         return [entry[1] for entry in self.log if entry[0] == "key_down"]
@@ -120,6 +122,12 @@ class FakeAgent:
     def stop_all(self, wait=False):
         self.stop_bots(list(self.running))
 
+    def request_screenshot(self, bot_id):
+        self.calls.append(("screenshot", bot_id))
+
+    def restart(self):
+        self.calls.append(("restart",))
+
     def exit(self, bot_id, code=1, bad_proxy=False, proxy=None):
         """Simulate the worker for bot_id exiting on its own."""
         self.running.pop(bot_id, None)
@@ -134,7 +142,12 @@ class FakeAgent:
             "agent": self.name, "cpu_percent": self.cpu, "cpu_count": self.cpu_count,
             "mem_available_mb": 4000, "mem_total_mb": 8000, "bots": sorted(self.running),
             "max_bots": self.max_bots, "platform": "Test", "bot_status": self.bot_status,
+            "logs": self.pop_logs(),
         }
+
+    def pop_logs(self):
+        logs, self.logs = getattr(self, "logs", []), []
+        return logs
 
 
 def proxy(host: str, port: str = "8080", country: str = "XX") -> dict:

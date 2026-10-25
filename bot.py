@@ -25,6 +25,7 @@ Features:
    - Automatic consent dismissal and room reconnect handling.
 """
 
+import base64
 import ctypes
 import logging
 import multiprocessing
@@ -58,6 +59,7 @@ DEFAULT_ROOM = "2cjg"
 BAD_PROXY_EXIT = 3                   # Worker exit code: its proxy can't reach the game
 MAX_FAILED_RELOADS = 2               # Stuck reloads in a row without reaching the game -> bad proxy
 STOP_WORKER = "stop"                 # Sent on a worker's update queue to make it close its browser and exit
+SCREENSHOT_REQUEST = {"cmd": "screenshot"}  # Sent on a worker's update queue to get a picture of its page
 IS_WINDOWS = sys.platform == "win32"
 STATUS_INTERVAL = 5.0                # Seconds between status reports while a bot's state doesn't change
 WINDOW_SIZE = (720, 480)        # Browser window size
@@ -286,6 +288,7 @@ class PowerlineBot:
         self.last_status = 0.0
         self.rounds = 0
         self.last_respawn: Optional[float] = None
+        self.screenshot_wanted = False
 
     def set_state(self, state: str, force: bool = False):
         """Report the bot's state (loading, connecting, lobby, playing, dead); at most every
@@ -386,10 +389,20 @@ class PowerlineBot:
             page.goto(self.target_url, wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
             logger.warning(f"{self.log_prefix} Navigation warning: {e}")
-        try:
-            page.wait_for_selector("#nick", state="visible", timeout=30000)
-        except Exception:
-            logger.warning(f"{self.log_prefix} Lobby didn't appear within 30s, continuing anyway.")
+        # Wait up to 30s for the lobby, a second at a time, answering the dashboard (screenshots)
+        # and noticing a stop or a new proxy meanwhile.
+        deadline = time.time() + 30
+        while True:
+            try:
+                page.wait_for_selector("#nick", state="visible", timeout=1000)
+                break
+            except Exception:
+                if self.poll_proxy_update():
+                    break  # The caller switches to the new proxy
+                self.serve_screenshot(page)
+                if time.time() >= deadline:
+                    logger.warning(f"{self.log_prefix} Lobby didn't appear within 30s, continuing anyway.")
+                    break
         self.set_low_graphics(page)
         self.debug_shot(page, "loaded")
 
@@ -440,10 +453,28 @@ class PowerlineBot:
                 update = self.proxy_updates.get_nowait()
                 if update == STOP_WORKER:
                     raise SystemExit(0)  # Unwinds the Camoufox context, which closes the browser
+                if update == SCREENSHOT_REQUEST:
+                    self.screenshot_wanted = True
+                    continue
                 self.pending_proxy = update
         except queue.Empty:
             pass
         return self.pending_proxy is not None
+
+    def serve_screenshot(self, page):
+        """Send a small picture of the page to the agent, if the dashboard asked for one."""
+        if not self.screenshot_wanted or self.reports is None:
+            return
+        self.screenshot_wanted = False
+        try:
+            data = page.screenshot(type="jpeg", quality=55)
+            self.reports.put_nowait({
+                "bot": self.instance_id,
+                "screenshot": base64.b64encode(data).decode("ascii"),
+                "time": time.time(),
+            })
+        except Exception as e:
+            logger.warning(f"{self.log_prefix} Screenshot for the dashboard failed: {e}")
 
     def switch_proxy(self, browser, page):
         """Reload the game on the pending proxy IP without closing the browser.
@@ -524,6 +555,7 @@ class PowerlineBot:
                     page = self.switch_proxy(browser, page)
                     died_at = None
                     self.reached_game, failed_reloads, seen_game = False, 0, False
+                self.serve_screenshot(page)
 
                 # 1. Dismiss popups / consent
                 self.dismiss_overlays_and_consent(page, humanizer=h)
@@ -637,6 +669,7 @@ class PowerlineBot:
                     self.set_state("playing")
                     if self.poll_proxy_update():
                         break  # Leave the round; the outer loop reloads on the new IP
+                    self.serve_screenshot(page)
                     if self.is_out_of_game(page):
                         self.rounds += 1
                         died_at = time.time()
@@ -713,6 +746,23 @@ def process_tree(pid: int) -> List[psutil.Process]:
         return []
 
 
+class ReportLogHandler(logging.Handler):
+    """Copies a worker's log lines to its agent, for the dashboard's live logs."""
+
+    def __init__(self, bot_id: int, reports: "multiprocessing.Queue"):
+        super().__init__(level=logging.INFO)
+        self.bot_id = bot_id
+        self.reports = reports
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            self.reports.put_nowait({"bot": self.bot_id, "log": {
+                "time": record.created, "level": record.levelname, "message": record.getMessage(),
+            }})
+        except Exception:
+            pass  # Never let log forwarding break the bot
+
+
 def exit_with_parent():
     """Make sure a worker and its browser never outlive the agent that started them."""
     if sys.platform.startswith("linux"):
@@ -756,6 +806,8 @@ def bot_worker_process(
         # Own process group, so the agent can kill this worker's browser without touching other groups.
         os.setsid()
     exit_with_parent()
+    if reports is not None:
+        logger.addHandler(ReportLogHandler(instance_id, reports))
 
     # Re-seed RNG per worker process to guarantee independent stochastic biometrics
     worker_seed = (os.getpid() ^ int(time.time() * 1000) ^ (instance_id << 16)) & 0xFFFFFFFF

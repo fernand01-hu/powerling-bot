@@ -107,7 +107,8 @@ class PageTest(unittest.TestCase):
     def test_every_action_the_page_sends_is_known(self):
         with open(PAGE_PATH) as f:
             html = f.read()
-        sent = set(re.findall(r'action: "([a-z_]+)"', html)) | set(re.findall(r'data-action="([a-z_]+)"', html))
+        sent = (set(re.findall(r'action: "([a-z_]+)"', html)) | set(re.findall(r'data-action="([a-z_]+)"', html))
+                | set(re.findall(r'data-bulk="([a-z_]+)"', html)))
         self.assertTrue(sent)
         self.assertEqual(sent - ACTIONS, set())
         self.assertEqual(ACTIONS - sent, set(), "an action the server supports has no button")
@@ -115,8 +116,8 @@ class PageTest(unittest.TestCase):
     def test_page_escapes_names_and_events(self):
         with open(PAGE_PATH) as f:
             html = f.read()
-        for field in ("b.name", "m.name", "e.message", "b.machine", "b.proxy"):
-            self.assertNotRegex(html, r"\$\{" + re.escape(field) + r"[^}]*\}", f"{field} is inserted without esc()")
+        for field in ("b.name", "m.name", "e.message", "b.machine", "b.proxy", "l.message", "l.machine", "a.text", "s.name"):
+            self.assertNotIn("${" + field + "}", html, f"{field} is inserted without esc()")
 
 
 class MoreCommandTest(unittest.TestCase):

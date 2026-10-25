@@ -191,7 +191,10 @@ class PageHelpersTest(unittest.TestCase):
         page = FakePage(evaluate=lambda s: True)
         page.goto_error = TimeoutError("slow")
         page.lobby_appears = False
-        make_bot().open_game(page)  # Logs warnings, never raises
+        fake_clock = itertools.count(1000.0, 10.0)  # Each look at the clock is 10s later: no real 30s wait
+        with mock.patch("bot.time.time", lambda: next(fake_clock)):
+            make_bot().open_game(page)  # Logs warnings, never raises
+        self.assertLessEqual(page.waits, 5)
 
     def test_low_graphics_failure_is_harmless(self):
         page = FakePage(evaluate=mock.Mock(side_effect=RuntimeError("detached")))
