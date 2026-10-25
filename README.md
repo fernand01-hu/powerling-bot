@@ -117,4 +117,10 @@ It starts when you log in and restarts the agent if it ever exits (log: `agent.l
 python3 -m unittest discover -s tests
 ```
 
-They cover the pure logic (steering, nicknames, proxy reassignment, agent placement and rebalancing, restart backoff, respawn delays, click sampling), the agent, the coordinator-agent protocol and the dashboard (server and commands) over localhost, using fake workers, so they need no browser or internet.
+178 tests (about 15s) that need no browser, no Webshare account and no internet: fake pages, browsers, agents and Webshare responses stand in for the real ones (`tests/fakes.py`). They cover:
+
+- **humanizer**: timing distributions, mouse paths (always end on target, no jumps, overshoot rules), click spots inside buttons, typing (typos always corrected), idle drift, fatigue, watchdog
+- **bot**: names, steering odds, status reports and throttling, proxy updates and the stop message, page loading, proxy switching, the respawn loop, exit codes, process-tree clean-up
+- **coordinator**: Webshare paging and errors, rotation countdown, randomized checks of proxy assignment and machine placement, restart backoff, bad-proxy benching, machines leaving, overload moves, snapshot states, state file
+- **agent and network**: message format (JSON only, size limit), every command, the serve loop, reconnects, wrong keys, stalled connections, pickle rejection
+- **dashboard**: login, every bad request, security headers, every button maps to an accepted action, every command
