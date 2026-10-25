@@ -25,9 +25,7 @@ Features:
    - Automatic consent dismissal and room reconnect handling.
 """
 
-import argparse
 import ctypes
-import json
 import logging
 import multiprocessing
 import os
@@ -40,7 +38,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -57,14 +54,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PowerlineBot")
 
-DEFAULT_WEBSHARE_API_KEY = os.environ.get("WEBSHARE_API_KEY", "")
 DEFAULT_ROOM = "2cjg"
-DEFAULT_BOTS_PER_PROXY = 3
-DEFAULT_GROUPS = 3
-DEFAULT_STAGGER_INTERVAL = 3.0  # Seconds between each bot in a group connecting
-DEFAULT_PROXY_CHECK_INTERVAL = 60.0  # Seconds between Webshare checks for rotated IPs
 BAD_PROXY_EXIT = 3                   # Worker exit code: its proxy can't reach the game
-BAD_PROXY_COOLDOWN = 30 * 60         # Seconds a bad proxy is left out of the rotation
 MAX_FAILED_RELOADS = 2               # Stuck reloads in a row without reaching the game -> bad proxy
 STOP_WORKER = "stop"                 # Sent on a worker's update queue to make it close its browser and exit
 IS_WINDOWS = sys.platform == "win32"
@@ -150,30 +141,6 @@ def sample_respawn_delay() -> float:
     return float(np.clip(delay, 0.6, 15.0))
 
 
-def proxy_key(proxy: Dict[str, str]) -> Tuple[str, str]:
-    return proxy["host"], proxy["port"]
-
-
-def reassign_proxies(current: List[Optional[Dict[str, str]]], available: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Keep each group on its proxy while it's still available and not carrying more than its share
-    of groups; every other group moves to the least-used proxy, so groups stay spread out."""
-    by_key = {proxy_key(p): p for p in available}
-    share = -(-len(current) // len(available))  # Most groups any one proxy should carry (ceil)
-    load = {k: 0 for k in by_key}
-    result: List[Optional[Dict[str, str]]] = [None] * len(current)
-    for g, p in enumerate(current):
-        k = proxy_key(p) if p else None
-        if k in load and load[k] < share:
-            result[g] = by_key[k]
-            load[k] += 1
-    for g in range(len(result)):
-        if result[g] is None:
-            k = min(load, key=load.get)  # Ties go to the earliest proxy in Webshare's list
-            result[g] = by_key[k]
-            load[k] += 1
-    return result
-
-
 def to_playwright_proxy(proxy: Dict[str, str]) -> Dict[str, str]:
     return {
         "server": f"http://{proxy['host']}:{proxy['port']}",
@@ -183,46 +150,7 @@ def to_playwright_proxy(proxy: Dict[str, str]) -> Dict[str, str]:
 
 
 # ============================================================================
-# 1. Webshare Proxy Manager
-# ============================================================================
-class WebshareManager:
-    """Fetches and manages rotating proxies from Webshare API v2."""
-
-    def __init__(self, api_key: str = DEFAULT_WEBSHARE_API_KEY):
-        self.api_key = api_key
-        self.proxies: List[Dict[str, str]] = []
-
-    def fetch_proxies(self) -> List[Dict[str, str]]:
-        url: Optional[str] = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100"
-        headers = {"Authorization": f"Token {self.api_key}"}
-        valid = []
-        try:
-            # The list is paginated; follow "next" until every page is read.
-            while url:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                for p in data.get("results", []):
-                    if p.get("valid", True):
-                        valid.append({
-                            "host": p["proxy_address"],
-                            "port": str(p["port"]),
-                            "user": p["username"],
-                            "pass": p["password"],
-                            "country": p.get("country_code", "XX"),
-                        })
-                url = data.get("next")
-        except Exception as e:
-            logger.warning(f"[Webshare] Failed to fetch proxies: {e}")
-            return self.proxies
-        if valid:
-            self.proxies = valid
-            logger.info(f"[Webshare] Fetched {len(valid)} active proxies from API.")
-        return self.proxies
-
-
-# ============================================================================
-# 2. EzSolver Cloudflare Turnstile Solver
+# 1. EzSolver Cloudflare Turnstile Solver
 # ============================================================================
 class EzSolver:
     """
@@ -323,7 +251,7 @@ class EzSolver:
 
 
 # ============================================================================
-# 3. Autonomous Powerline Game Controller
+# 2. Autonomous Powerline Game Controller
 # ============================================================================
 class PowerlineBot:
     """Camoufox-powered autonomous Powerline.io player."""
@@ -468,7 +396,7 @@ class PowerlineBot:
                 return  # Leave it to the outer loop (lobby, kicked, ...)
 
     def poll_proxy_update(self) -> bool:
-        """Pick up the newest proxy sent by the manager; True if the bot should switch to it."""
+        """Pick up the newest proxy sent by the coordinator; True if the bot should switch to it."""
         if self.proxy_updates is None:
             return False
         try:
@@ -555,7 +483,7 @@ class PowerlineBot:
             died_at: Optional[float] = None  # When the current death happened, if known
 
             while True:
-                # 0. Follow a proxy IP change from the manager
+                # 0. Follow a proxy IP change from the coordinator
                 if self.poll_proxy_update():
                     page = self.switch_proxy(browser, page)
                     died_at = None
@@ -616,6 +544,8 @@ class PowerlineBot:
                         if not seen_game and not self.reached_game:
                             failed_reloads += 1
                             if failed_reloads >= MAX_FAILED_RELOADS:
+                                if self.poll_proxy_update():
+                                    continue  # The coordinator already moved this bot; switch instead
                                 logger.warning(
                                     f"{self.log_prefix} Proxy {self.proxy['host'] if self.proxy else 'direct'} "
                                     f"never got past connecting; reporting it as bad."
@@ -704,7 +634,7 @@ class PowerlineBot:
                     h.sleep(mean=0.13, sigma=0.015, tau=0.02, min_floor=0.11)
 
     def run(self) -> Optional[int]:
-        """Run until terminated; an error ends the worker so the manager restarts it.
+        """Run until terminated; an error ends the worker so the coordinator restarts it.
         Returns BAD_PROXY_EXIT when the proxy never let the game connect."""
         self.reached_game = False
         try:
@@ -741,9 +671,9 @@ def process_tree(pid: int) -> List[psutil.Process]:
 
 
 def exit_with_parent():
-    """Make sure a worker and its browser never outlive the manager."""
+    """Make sure a worker and its browser never outlive the agent that started them."""
     if sys.platform.startswith("linux"):
-        # Fast path: the kernel sends SIGTERM as soon as the manager dies.
+        # Fast path: the kernel sends SIGTERM as soon as the agent dies.
         try:
             PR_SET_PDEATHSIG = 1
             ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
@@ -772,14 +702,15 @@ def bot_worker_process(
     proxy_updates: "multiprocessing.Queue",
     debug_dir: Optional[str] = None,
     worker_home: Optional[str] = None,
+    reports: Optional["multiprocessing.Queue"] = None,
 ):
     """Entry point for each independent bot worker process with isolated profile and gradual connection."""
-    # Forked workers inherit the manager's signal handlers; reset them so a worker never
-    # kills its siblings. Ctrl+C is handled by the manager, SIGTERM unwinds the Camoufox context.
+    # Forked workers inherit the agent's signal handlers; reset them so a worker never
+    # kills its siblings. Ctrl+C is handled by the coordinator, SIGTERM unwinds the Camoufox context.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     if hasattr(os, "setsid"):
-        # Own process group, so the manager can kill this worker's browser without touching other groups.
+        # Own process group, so the agent can kill this worker's browser without touching other groups.
         os.setsid()
     exit_with_parent()
 
@@ -809,196 +740,17 @@ def bot_worker_process(
             debug_dir=debug_dir,
         )
         exit_code = bot.run()
+        if exit_code == BAD_PROXY_EXIT and reports is not None:
+            # Say which proxy failed: the coordinator may have moved this bot's group in the meantime.
+            reports.put({"bot": instance_id, "bad_proxy": bot.proxy})
     finally:
         shutil.rmtree(worker_home, ignore_errors=True)
     if exit_code:
         sys.exit(exit_code)
 
 
-# ============================================================================
-# CLI Entrypoint & Multi-Process Cycle Manager
-# ============================================================================
-def main():
-    parser = argparse.ArgumentParser(description="Powerline.io Autonomous Bot (Camoufox C++ + EzSolver)")
-    parser.add_argument("--room", default=DEFAULT_ROOM, help="Target game room code (default: 2cjg)")
-    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode (default: False)")
-    parser.add_argument(
-        "--webshare-key",
-        default=DEFAULT_WEBSHARE_API_KEY,
-        help="Webshare API key (default: $WEBSHARE_API_KEY)",
-    )
-    parser.add_argument(
-        "--groups",
-        type=int,
-        default=DEFAULT_GROUPS,
-        help="Number of bot groups, each on its own proxy IP (default: 3)",
-    )
-    parser.add_argument(
-        "--bots-per-proxy",
-        type=int,
-        default=DEFAULT_BOTS_PER_PROXY,
-        help="Number of bots in each group / sharing one proxy (default: 3)",
-    )
-    parser.add_argument(
-        "--stagger-interval",
-        type=float,
-        default=DEFAULT_STAGGER_INTERVAL,
-        help="Average seconds between each bot in a group connecting (default: 3.0)",
-    )
-    parser.add_argument(
-        "--proxy-check-interval",
-        type=float,
-        default=DEFAULT_PROXY_CHECK_INTERVAL,
-        help="Seconds between Webshare checks for rotated proxy IPs (default: 60)",
-    )
-    parser.add_argument(
-        "--debug-dir",
-        help="Save screenshots of key moments (load, spawn, death, every 30s in game) to this folder",
-    )
-    args = parser.parse_args()
-
-    if not args.webshare_key:
-        parser.error("no Webshare API key: set WEBSHARE_API_KEY or pass --webshare-key")
-    if args.groups < 1 or args.bots_per_proxy < 1 or args.proxy_check_interval <= 0:
-        parser.error("--groups and --bots-per-proxy must be >= 1, --proxy-check-interval > 0")
-
-    # Ensure DISPLAY is set for non-headless runs
-    if sys.platform.startswith("linux") and not args.headless and not os.environ.get("DISPLAY"):
-        os.environ["DISPLAY"] = ":0"
-
-    total = args.groups * args.bots_per_proxy
-    if args.debug_dir:
-        os.makedirs(args.debug_dir, exist_ok=True)
-
-    print("=" * 65)
-    print(" Powerline.io Autonomous Bot (Camoufox C++ Always-On Groups)")
-    print(f" Room: #{args.room} | Groups: {args.groups} x {args.bots_per_proxy} bots (1 IP per group)")
-    print(f" Proxy check every {args.proxy_check_interval:.0f}s | Stagger: {args.stagger_interval}s | Headless: {args.headless}")
-    print("=" * 65)
-
-    proxy_mgr = WebshareManager(api_key=args.webshare_key)
-    while not proxy_mgr.fetch_proxies():
-        logger.error("[Manager] No proxies available from Webshare, retrying in 30s...")
-        time.sleep(30)
-    if len(proxy_mgr.proxies) < args.groups:
-        logger.warning(f"[Manager] Only {len(proxy_mgr.proxies)} proxies for {args.groups} groups; some groups share an IP.")
-
-    group_proxies: List[Dict[str, str]] = reassign_proxies([None] * args.groups, proxy_mgr.proxies)
-    # One name per bot for the whole run, kept across deaths and worker restarts.
-    nicknames = [generate_random_nickname() for _ in range(total)]
-    workers: List[Optional[multiprocessing.Process]] = [None] * total
-    update_queues: List[Optional[multiprocessing.Queue]] = [None] * total
-
-    def worker_home(i: int) -> str:
-        # Chosen here (unique per manager run) so the manager can delete it even if it has to kill the worker.
-        return os.path.join(tempfile.gettempdir(), f"camoufox_worker_{os.getpid()}_{i}")
-
-    def spawn_worker(i: int, start_delay: float):
-        # Fresh queue, so a restarted worker doesn't replay updates meant for the old one.
-        update_queues[i] = multiprocessing.Queue()
-        p = multiprocessing.Process(
-            target=bot_worker_process,
-            args=(
-                i, args.room, group_proxies[i // args.bots_per_proxy], args.headless,
-                start_delay, nicknames[i], update_queues[i], args.debug_dir, worker_home(i),
-            ),
-            name=f"PowerlineWorker-{i}",
-        )
-        p.daemon = True
-        p.start()
-        workers[i] = p
-        logger.info(f"[Manager] Started worker #{i} '{nicknames[i]}' (PID: {p.pid})")
-
-    def stop_workers(items: List[Tuple[int, multiprocessing.Process]]):
-        """Stop workers and every browser process they started, with one shared deadline."""
-        # Record each worker's browser processes first: once a worker is killed, Windows has no
-        # process group to find them by.
-        trees = {i: process_tree(p.pid) for i, p in items}
-        for i, p in items:
-            if p.is_alive():
-                update_queues[i].put(STOP_WORKER)  # Asks the worker to close its browser itself
-                if not IS_WINDOWS:
-                    p.terminate()  # SIGTERM also unwinds it (on Windows this would be a hard kill)
-        deadline = time.time() + 8
-        for i, p in items:
-            p.join(timeout=max(0.0, deadline - time.time()))
-            if p.is_alive():
-                p.kill()
-                p.join(timeout=2)
-            kill_processes(trees[i])
-            if hasattr(os, "killpg"):
-                # Also catches browser processes started after the snapshot.
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            shutil.rmtree(worker_home(i), ignore_errors=True)
-
-    bad_until: Dict[Tuple[str, str], float] = {}
-
-    def usable_proxies() -> List[Dict[str, str]]:
-        """Webshare's list minus proxies benched as bad; all of them if every one is benched."""
-        now = time.time()
-        usable = [p for p in proxy_mgr.proxies if bad_until.get(proxy_key(p), 0) <= now]
-        return usable or proxy_mgr.proxies
-
-    def apply_proxies():
-        nonlocal group_proxies
-        new = reassign_proxies(group_proxies, usable_proxies())
-        for g, (old, cur) in enumerate(zip(group_proxies, new)):
-            if proxy_key(old) != proxy_key(cur):
-                logger.info(
-                    f"[Manager] Group {g} IP rotated: {old['host']}:{old['port']} -> {cur['host']}:{cur['port']}"
-                )
-                for i in range(g * args.bots_per_proxy, (g + 1) * args.bots_per_proxy):
-                    if workers[i] is not None and workers[i].is_alive():
-                        update_queues[i].put(cur)
-        group_proxies = new
-
-    def check_proxies():
-        if proxy_mgr.fetch_proxies():
-            apply_proxies()
-
-    def sigint_handler(sig, frame):
-        logger.info("[Manager] Shutting down all worker processes...")
-        stop_workers([(i, p) for i, p in enumerate(workers) if p is not None])
-        logger.info("[Manager] All workers stopped cleanly.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, sigint_handler)
-    signal.signal(signal.SIGTERM, sigint_handler)
-    if hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, sigint_handler)  # Windows: Ctrl+Break, how background consoles get stopped
-
-    for g in range(args.groups):
-        proxy = group_proxies[g]
-        logger.info(f"[Manager] Group {g} on {proxy['host']}:{proxy['port']} ({args.bots_per_proxy} bots)")
-        for k in range(args.bots_per_proxy):
-            spawn_worker(g * args.bots_per_proxy + k, (k * args.stagger_interval) + random.uniform(1.0, 3.5))
-
-    next_proxy_check = time.time() + args.proxy_check_interval
-    while True:
-        if time.time() >= next_proxy_check:
-            check_proxies()
-            next_proxy_check = time.time() + args.proxy_check_interval
-
-        # Restart crashed workers on their group's current proxy, with the same name
-        for i, p in enumerate(workers):
-            if p is not None and not p.is_alive():
-                if p.exitcode == BAD_PROXY_EXIT:
-                    bad = group_proxies[i // args.bots_per_proxy]
-                    logger.warning(
-                        f"[Manager] Worker #{i} reports proxy {bad['host']}:{bad['port']} can't reach the game; "
-                        f"benching it for {BAD_PROXY_COOLDOWN // 60} min and moving its group."
-                    )
-                    bad_until[proxy_key(bad)] = time.time() + BAD_PROXY_COOLDOWN
-                    apply_proxies()
-                else:
-                    logger.warning(f"[Manager] Worker #{i} exited unexpectedly (code {p.exitcode}). Restarting...")
-                stop_workers([(i, p)])
-                spawn_worker(i, random.uniform(1.0, 3.5))
-
-        time.sleep(1)
-
 if __name__ == "__main__":
+    # Kept so `python3 bot.py ...` still works; the manager now lives in coordinator.py.
+    from coordinator import main
+
     main()

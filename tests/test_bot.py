@@ -9,9 +9,9 @@ from bot import (
     OPPOSITE_DIRECTIONS,
     generate_random_nickname,
     pick_next_direction,
-    reassign_proxies,
     sample_respawn_delay,
 )
+from coordinator import pick_agent, reassign_proxies
 from humanizer import sample_bivariate_gaussian_box, sample_ex_gaussian
 
 
@@ -76,6 +76,19 @@ class ReassignProxiesTest(unittest.TestCase):
     def test_shares_when_not_enough(self):
         result = reassign_proxies([None] * 3, [proxy("a")])
         self.assertEqual([p["host"] for p in result], ["a", "a", "a"])
+
+
+class PickAgentTest(unittest.TestCase):
+    def test_single_agent(self):
+        self.assertEqual(pick_agent([7], [16]), 0)
+
+    def test_fewest_bots_per_core(self):
+        # 16 cores with 6 bots (0.375/core) has more room than 4 cores with 2 bots (0.5/core).
+        self.assertEqual(pick_agent([6, 2], [16, 4]), 0)
+        self.assertEqual(pick_agent([8, 1], [16, 4]), 1)
+
+    def test_ties_go_to_first_agent(self):
+        self.assertEqual(pick_agent([0, 0, 0], [16, 4, 12]), 0)
 
 
 class RespawnDelayTest(unittest.TestCase):
