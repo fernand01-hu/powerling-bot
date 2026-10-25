@@ -558,7 +558,8 @@ class PowerlineBot:
                             h.sleep(2.0, 0.3, 0.4, min_floor=1.0)
                         except Exception as e:
                             logger.warning(f"{self.log_prefix} Page reload failed ({e}); restarting the browser.")
-                            return None
+                            # A proxy that now refuses connections was most likely rotated out by Webshare.
+                            return BAD_PROXY_EXIT if "PROXY" in str(e).upper() else None
                         continue
 
                     h.sleep(0.3, 0.05, 0.08, min_floor=0.15)

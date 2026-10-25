@@ -39,10 +39,43 @@ python3 coordinator.py --groups 4 --bots-per-proxy 2 --headless
 
 Stop with `Ctrl+C`: the coordinator tells every agent to stop its workers, each worker closes its browser, and anything left in a worker's process group is killed (other Camoufox processes on the machine are not touched). On Windows, Ctrl+Break works the same way. If the coordinator itself crashes or is killed, its workers and their browsers shut down on their own.
 
+## Several machines
+
+The coordinator can spread the bots over several machines on the same network. Each machine runs an agent that connects to the coordinator; new bots go to the machine with the fewest bots per CPU thread, a machine that stays above 85% CPU for 30s hands one bot (same name and proxy) to a machine below 65%, and the bots of a machine that disconnects are restarted elsewhere. Only the coordinator needs the Webshare key.
+
+All machines need the same code (agents with different code are refused) and a shared secret:
+
+```bash
+export POWERLINE_AGENT_KEY=some-long-random-secret   # same value on every machine
+
+# Coordinator (here: also runs at most 1 bot itself)
+python3 coordinator.py --listen 0.0.0.0 --local-max-bots 1 --headless
+
+# Every other machine (Windows: `set POWERLINE_AGENT_KEY=...` and `python agent.py ...`)
+python3 agent.py --coordinator 192.168.1.96 --headless
+```
+
+| Coordinator option | Default | Description |
+| --- | --- | --- |
+| `--listen` | off | Accept agents on `HOST[:PORT]` (default port 4041) |
+| `--wait-agents` | `15` | Seconds to let agents connect before placing bots |
+| `--local-max-bots` | no limit | Most bots this machine runs itself |
+| `--no-local-agent` | off | Run no bots on the coordinator machine |
+
+| Agent option | Default | Description |
+| --- | --- | --- |
+| `--coordinator` | required | Coordinator address `HOST[:PORT]` |
+| `--max-bots` | no limit | Most bots this machine runs |
+| `--headless` | off | Run browsers headless |
+| `--name` | hostname | Name shown in the coordinator's log |
+| `--debug-dir` | off | Save screenshots of key moments |
+
+If the connection drops, an agent stops its bots and reconnects every 5s, so either side can be restarted at any time. A bot that keeps failing waits longer before each restart (up to 60s), and proxy failures make the coordinator re-read Webshare's list right away, since they usually mean Webshare just rotated its IPs.
+
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests
 ```
 
-They cover the pure logic (steering, nicknames, proxy reassignment, agent placement, respawn delays, click sampling) and need no browser or network.
+They cover the pure logic (steering, nicknames, proxy reassignment, agent placement and rebalancing, restart backoff, respawn delays, click sampling), the agent and the coordinator-agent protocol over localhost, using fake workers, so they need no browser or internet.

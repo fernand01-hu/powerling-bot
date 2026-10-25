@@ -11,7 +11,7 @@ from bot import (
     pick_next_direction,
     sample_respawn_delay,
 )
-from coordinator import pick_agent, reassign_proxies
+from coordinator import pick_agent, pick_move, reassign_proxies, restart_delay
 from humanizer import sample_bivariate_gaussian_box, sample_ex_gaussian
 
 
@@ -78,17 +78,58 @@ class ReassignProxiesTest(unittest.TestCase):
         self.assertEqual([p["host"] for p in result], ["a", "a", "a"])
 
 
+def stat(bots, cpu_count, cpu=0.0, max_bots=None):
+    return {"bots": bots, "cpu_count": cpu_count, "cpu": cpu, "max_bots": max_bots}
+
+
 class PickAgentTest(unittest.TestCase):
     def test_single_agent(self):
-        self.assertEqual(pick_agent([7], [16]), 0)
+        self.assertEqual(pick_agent([stat(7, 16)]), 0)
 
     def test_fewest_bots_per_core(self):
         # 16 cores with 6 bots (0.375/core) has more room than 4 cores with 2 bots (0.5/core).
-        self.assertEqual(pick_agent([6, 2], [16, 4]), 0)
-        self.assertEqual(pick_agent([8, 1], [16, 4]), 1)
+        self.assertEqual(pick_agent([stat(6, 16), stat(2, 4)]), 0)
+        self.assertEqual(pick_agent([stat(8, 16), stat(1, 4)]), 1)
 
     def test_ties_go_to_first_agent(self):
-        self.assertEqual(pick_agent([0, 0, 0], [16, 4, 12]), 0)
+        self.assertEqual(pick_agent([stat(0, 16), stat(0, 4), stat(0, 12)]), 0)
+
+    def test_skips_overloaded_and_full_agents(self):
+        self.assertEqual(pick_agent([stat(1, 16, cpu=95), stat(5, 4)]), 1)
+        self.assertEqual(pick_agent([stat(1, 16, max_bots=1), stat(5, 4)]), 1)
+
+    def test_all_overloaded_still_places(self):
+        self.assertEqual(pick_agent([stat(6, 16, cpu=95), stat(1, 4, cpu=90)]), 1)
+
+    def test_no_room_anywhere(self):
+        self.assertIsNone(pick_agent([stat(2, 4, max_bots=2)]))
+        self.assertIsNone(pick_agent([]))
+
+
+class PickMoveTest(unittest.TestCase):
+    def test_moves_from_overloaded_to_headroom(self):
+        self.assertEqual(pick_move([stat(8, 16, cpu=92), stat(1, 12, cpu=30)]), (0, 1))
+
+    def test_no_move_without_overload(self):
+        self.assertIsNone(pick_move([stat(8, 16, cpu=80), stat(0, 12, cpu=5)]))
+
+    def test_no_move_without_headroom(self):
+        self.assertIsNone(pick_move([stat(8, 16, cpu=92), stat(3, 12, cpu=70)]))
+        self.assertIsNone(pick_move([stat(8, 16, cpu=92), stat(2, 12, cpu=10, max_bots=2)]))
+
+    def test_moves_to_least_loaded_target(self):
+        self.assertEqual(pick_move([stat(8, 16, cpu=92), stat(3, 4, cpu=40), stat(3, 12, cpu=40)]), (0, 2))
+
+
+class RestartDelayTest(unittest.TestCase):
+    def test_first_restart_is_quick(self):
+        for _ in range(100):
+            self.assertTrue(1.0 <= restart_delay(1) <= 3.5)
+
+    def test_backs_off_and_caps(self):
+        self.assertTrue(2.0 <= restart_delay(2) <= 4.0)
+        self.assertTrue(8.0 <= restart_delay(4) <= 10.0)
+        self.assertTrue(60.0 <= restart_delay(20) <= 62.0)
 
 
 class RespawnDelayTest(unittest.TestCase):

@@ -8,17 +8,23 @@ them; an agent only starts and stops browser workers on its own machine and repo
 - poll(): workers that exited since the last call (and whether their proxy was bad).
 - health(): CPU / RAM and the bots it runs, so the coordinator can balance machines.
 
-Commands and reports are plain picklable values, so the same calls can later be sent over
-the network to agents on other machines.
+Run on its own (`python3 agent.py --coordinator HOST:PORT`), it connects to a coordinator
+over the LAN and serves it: commands arrive as messages, and exits and health go back the
+same way. Both sides must share the secret in $POWERLINE_AGENT_KEY. If the connection
+drops, the agent stops its bots (the coordinator re-places them) and keeps reconnecting.
 """
 
+import argparse
+import hashlib
 import logging
 import multiprocessing
+import multiprocessing.connection
 import os
 import platform
 import queue
 import shutil
 import signal
+import sys
 import tempfile
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -28,6 +34,33 @@ import psutil
 from bot import BAD_PROXY_EXIT, IS_WINDOWS, STOP_WORKER, bot_worker_process, kill_processes, process_tree
 
 logger = logging.getLogger("PowerlineBot.Agent")
+
+DEFAULT_PORT = 4041
+HEALTH_INTERVAL = 5.0     # Seconds between health reports to the coordinator
+RECONNECT_DELAY = 5.0     # Seconds between attempts to reach the coordinator
+AGENT_KEY_ENV = "POWERLINE_AGENT_KEY"
+
+
+def code_version() -> str:
+    """Fingerprint of the code that runs the bots; coordinator and agents must match."""
+    digest = hashlib.sha256()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("bot.py", "agent.py", "humanizer.py"):
+        with open(os.path.join(here, name), "rb") as f:
+            digest.update(f.read().replace(b"\r\n", b"\n"))  # Same fingerprint with Windows line endings
+    return digest.hexdigest()[:12]
+
+
+def parse_address(address: str) -> Tuple[str, int]:
+    host, _, port = address.rpartition(":")
+    return (host, int(port)) if host else (address, DEFAULT_PORT)
+
+
+def agent_key() -> bytes:
+    key = os.environ.get(AGENT_KEY_ENV, "")
+    if not key:
+        sys.exit(f"Set ${AGENT_KEY_ENV} to the secret shared by the coordinator and its agents.")
+    return key.encode()
 
 
 class Agent:
@@ -39,8 +72,10 @@ class Agent:
         headless: bool = False,
         debug_dir: Optional[str] = None,
         worker_target: Callable = bot_worker_process,  # Swappable so tests can run without a browser
+        max_bots: Optional[int] = None,
     ):
         self.name = name or platform.node()
+        self.max_bots = max_bots
         self.worker_target = worker_target
         self.headless = headless
         self.debug_dir = debug_dir
@@ -151,4 +186,82 @@ class Agent:
             "cpu_count": psutil.cpu_count(),
             "mem_available_mb": mem.available // (1024 * 1024),
             "bots": sorted(self.workers),
+            "max_bots": self.max_bots,
         }
+
+    def handle(self, msg: dict):
+        """Apply a command message from the coordinator."""
+        if msg["type"] == "start":
+            self.start_bot(msg["bot"], msg["room"], msg["proxy"], msg["nickname"], msg["start_delay"])
+        elif msg["type"] == "update_proxy":
+            self.update_proxy(msg["bot"], msg["proxy"])
+        elif msg["type"] == "stop":
+            self.stop_bots(msg["bots"])
+        elif msg["type"] == "stop_all":
+            self.stop_all()
+        elif msg["type"] == "rejected":
+            logger.error(f"[Agent {self.name}] Coordinator refused this agent: {msg['reason']}")
+            sys.exit(1)
+
+
+def serve(conn: multiprocessing.connection.Connection, agent: Agent):
+    """Serve one coordinator connection until it drops."""
+    conn.send({"type": "hello", "version": code_version(), **agent.health()})
+    next_health = time.time() + HEALTH_INTERVAL
+    while True:
+        if conn.poll(0.5):
+            agent.handle(conn.recv())
+        for event in agent.poll():
+            conn.send(event)
+        if time.time() >= next_health:
+            conn.send({"type": "health", **agent.health()})
+            next_health = time.time() + HEALTH_INTERVAL
+
+
+def run_agent(address: Tuple[str, int], key: bytes, agent: Agent):
+    """Stay connected to the coordinator, reconnecting whenever the connection drops."""
+    while True:
+        try:
+            conn = multiprocessing.connection.Client(address, authkey=key)
+        except multiprocessing.AuthenticationError:
+            sys.exit(f"Coordinator at {address[0]}:{address[1]} rejected the key in ${AGENT_KEY_ENV}.")
+        except OSError as e:
+            logger.info(f"[Agent {agent.name}] Coordinator at {address[0]}:{address[1]} not reachable ({e}); retrying...")
+            time.sleep(RECONNECT_DELAY)
+            continue
+        logger.info(f"[Agent {agent.name}] Connected to coordinator at {address[0]}:{address[1]}.")
+        try:
+            serve(conn, agent)
+        except (EOFError, OSError):
+            logger.warning(f"[Agent {agent.name}] Lost the coordinator; stopping bots until it's back.")
+            agent.stop_all()
+            conn.close()
+            time.sleep(RECONNECT_DELAY)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run Powerline bots on this machine for a coordinator")
+    parser.add_argument("--coordinator", required=True, help=f"Coordinator address HOST[:PORT] (default port {DEFAULT_PORT})")
+    parser.add_argument("--name", help="Name for this machine in the coordinator's logs (default: hostname)")
+    parser.add_argument("--headless", action="store_true", help="Run browsers headless")
+    parser.add_argument("--max-bots", type=int, help="Never run more than this many bots here")
+    parser.add_argument("--debug-dir", help="Save screenshots of key moments to this folder")
+    args = parser.parse_args()
+
+    agent = Agent(name=args.name, headless=args.headless, debug_dir=args.debug_dir, max_bots=args.max_bots)
+
+    def shutdown(*_):
+        logger.info(f"[Agent {agent.name}] Shutting down, stopping bots...")
+        agent.stop_all()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, shutdown)  # Windows: Ctrl+Break, how background consoles get stopped
+
+    run_agent(parse_address(args.coordinator), agent_key(), agent)
+
+
+if __name__ == "__main__":
+    main()
