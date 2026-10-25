@@ -38,11 +38,13 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import psutil
 from camoufox.pkgman import launch_path
 from camoufox.sync_api import Camoufox
 from humanizer import Humanizer
@@ -64,6 +66,8 @@ DEFAULT_PROXY_CHECK_INTERVAL = 60.0  # Seconds between Webshare checks for rotat
 BAD_PROXY_EXIT = 3                   # Worker exit code: its proxy can't reach the game
 BAD_PROXY_COOLDOWN = 30 * 60         # Seconds a bad proxy is left out of the rotation
 MAX_FAILED_RELOADS = 2               # Stuck reloads in a row without reaching the game -> bad proxy
+STOP_WORKER = "stop"                 # Sent on a worker's update queue to make it close its browser and exit
+IS_WINDOWS = sys.platform == "win32"
 WINDOW_SIZE = (720, 480)        # Browser window size
 MIN_HOLD = 0.28                 # Shortest time a direction is held
 
@@ -469,7 +473,10 @@ class PowerlineBot:
             return False
         try:
             while True:
-                self.pending_proxy = self.proxy_updates.get_nowait()
+                update = self.proxy_updates.get_nowait()
+                if update == STOP_WORKER:
+                    raise SystemExit(0)  # Unwinds the Camoufox context, which closes the browser
+                self.pending_proxy = update
         except queue.Empty:
             pass
         return self.pending_proxy is not None
@@ -715,6 +722,46 @@ class PowerlineBot:
 # ============================================================================
 # Multi-Process Worker Function
 # ============================================================================
+def kill_processes(procs: List[psutil.Process]):
+    """Kill processes (e.g. a worker's browser) that may already be gone."""
+    for proc in procs:
+        try:
+            proc.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(procs, timeout=3)
+
+
+def process_tree(pid: int) -> List[psutil.Process]:
+    """A process's descendants (a worker's Playwright driver and browser processes)."""
+    try:
+        return psutil.Process(pid).children(recursive=True)
+    except psutil.Error:
+        return []
+
+
+def exit_with_parent():
+    """Make sure a worker and its browser never outlive the manager."""
+    if sys.platform.startswith("linux"):
+        # Fast path: the kernel sends SIGTERM as soon as the manager dies.
+        try:
+            PR_SET_PDEATHSIG = 1
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        except OSError:
+            pass
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def watch():
+        while parent.is_alive():
+            time.sleep(2)
+        kill_processes(process_tree(os.getpid()))
+        os._exit(0)
+
+    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+
 def bot_worker_process(
     instance_id: int,
     room: str,
@@ -731,17 +778,10 @@ def bot_worker_process(
     # kills its siblings. Ctrl+C is handled by the manager, SIGTERM unwinds the Camoufox context.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    # Own process group, so the manager can kill this worker's browser without touching other groups.
-    os.setsid()
-    # Get SIGTERM if the manager dies abruptly, so no orphaned browsers keep running.
-    try:
-        PR_SET_PDEATHSIG = 1
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
-    except OSError:
-        pass
-    parent = multiprocessing.parent_process()
-    if parent is not None and os.getppid() != parent.pid:
-        sys.exit(0)  # Manager already gone before prctl took effect
+    if hasattr(os, "setsid"):
+        # Own process group, so the manager can kill this worker's browser without touching other groups.
+        os.setsid()
+    exit_with_parent()
 
     # Re-seed RNG per worker process to guarantee independent stochastic biometrics
     worker_seed = (os.getpid() ^ int(time.time() * 1000) ^ (instance_id << 16)) & 0xFFFFFFFF
@@ -823,7 +863,7 @@ def main():
         parser.error("--groups and --bots-per-proxy must be >= 1, --proxy-check-interval > 0")
 
     # Ensure DISPLAY is set for non-headless runs
-    if not args.headless and not os.environ.get("DISPLAY"):
+    if sys.platform.startswith("linux") and not args.headless and not os.environ.get("DISPLAY"):
         os.environ["DISPLAY"] = ":0"
 
     total = args.groups * args.bots_per_proxy
@@ -869,17 +909,30 @@ def main():
         workers[i] = p
         logger.info(f"[Manager] Started worker #{i} '{nicknames[i]}' (PID: {p.pid})")
 
-    def stop_worker(i: int, p: multiprocessing.Process, deadline: Optional[float] = None):
-        p.join(timeout=max(0.0, (deadline or time.time() + 5) - time.time()))
-        if p.is_alive():
-            p.kill()
-            p.join(timeout=2)
-        # Each worker leads its own process group; kill whatever browser processes are left in it.
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        shutil.rmtree(worker_home(i), ignore_errors=True)
+    def stop_workers(items: List[Tuple[int, multiprocessing.Process]]):
+        """Stop workers and every browser process they started, with one shared deadline."""
+        # Record each worker's browser processes first: once a worker is killed, Windows has no
+        # process group to find them by.
+        trees = {i: process_tree(p.pid) for i, p in items}
+        for i, p in items:
+            if p.is_alive():
+                update_queues[i].put(STOP_WORKER)  # Asks the worker to close its browser itself
+                if not IS_WINDOWS:
+                    p.terminate()  # SIGTERM also unwinds it (on Windows this would be a hard kill)
+        deadline = time.time() + 8
+        for i, p in items:
+            p.join(timeout=max(0.0, deadline - time.time()))
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2)
+            kill_processes(trees[i])
+            if hasattr(os, "killpg"):
+                # Also catches browser processes started after the snapshot.
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            shutil.rmtree(worker_home(i), ignore_errors=True)
 
     bad_until: Dict[Tuple[str, str], float] = {}
 
@@ -908,19 +961,14 @@ def main():
 
     def sigint_handler(sig, frame):
         logger.info("[Manager] Shutting down all worker processes...")
-        started = [(i, p) for i, p in enumerate(workers) if p is not None]
-        for _, p in started:
-            if p.is_alive():
-                p.terminate()
-        # One shared deadline, so shutting down many workers doesn't wait 5s for each in turn.
-        deadline = time.time() + 8
-        for i, p in started:
-            stop_worker(i, p, deadline)
+        stop_workers([(i, p) for i, p in enumerate(workers) if p is not None])
         logger.info("[Manager] All workers stopped cleanly.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, sigint_handler)
     signal.signal(signal.SIGTERM, sigint_handler)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, sigint_handler)  # Windows: Ctrl+Break, how background consoles get stopped
 
     for g in range(args.groups):
         proxy = group_proxies[g]
@@ -947,7 +995,7 @@ def main():
                     apply_proxies()
                 else:
                     logger.warning(f"[Manager] Worker #{i} exited unexpectedly (code {p.exitcode}). Restarting...")
-                stop_worker(i, p)
+                stop_workers([(i, p)])
                 spawn_worker(i, random.uniform(1.0, 3.5))
 
         time.sleep(1)

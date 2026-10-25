@@ -11,8 +11,8 @@ Runs several Camoufox (anti-detect Firefox) browser instances that join a powerl
 
 ## Requirements
 
-- Linux with a display (or `--headless`)
-- Python 3.10+
+- Linux with a display, or Windows 10/11 (either one can use `--headless`)
+- Python 3.10+ (tested on 3.10 and 3.14)
 - `pip install -r requirements.txt && python3 -m camoufox fetch`
 
 ## Usage
@@ -34,7 +34,7 @@ python3 bot.py --groups 4 --bots-per-proxy 2 --headless
 | `--headless` | off | Run browsers headless |
 | `--debug-dir` | off | Save screenshots of key moments (load, spawn, death, every 30s in game) to this folder |
 
-Stop with `Ctrl+C`: the manager terminates every worker, each worker closes its browser, and anything left in a worker's process group is killed (other Camoufox processes on the machine are not touched). If the manager itself crashes or is killed, its workers shut down on their own.
+Stop with `Ctrl+C`: the manager terminates every worker, each worker closes its browser, and anything left in a worker's process group is killed (other Camoufox processes on the machine are not touched). On Windows, Ctrl+Break works the same way. If the manager itself crashes or is killed, its workers and their browsers shut down on their own.
 
 ## Tests
 
