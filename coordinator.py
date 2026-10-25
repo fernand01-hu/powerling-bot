@@ -576,7 +576,10 @@ class Coordinator:
             else:
                 agent.max_bots = limit
             self.max_bots[id(agent)] = limit
-            logger.info(f"[Coordinator] Dashboard: {agent.name} limited to {limit if limit is not None else 'no limit'} bots.")
+            logger.info(
+                f"[Coordinator] Dashboard: {agent.name} limited to {limit} bots."
+                if limit is not None else f"[Coordinator] Dashboard: {agent.name} no longer has a bot limit."
+            )
             extra = sorted(b for b, a in self.bot_agent.items() if a is agent)[limit:] if limit is not None else []
             self.unplace(extra)
             for i, b in enumerate(extra):

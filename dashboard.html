@@ -75,7 +75,7 @@
   .s-stopped::before { background: var(--idle); }
   .muted { color: var(--muted); }
   .countdown { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
-  .events { max-height: 260px; overflow-y: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .events { max-height: 260px; overflow-y: auto; scrollbar-color: var(--border) transparent; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .events div { padding: 2px 0; border-bottom: 1px dashed var(--border); overflow-wrap: anywhere; }
   .events .WARNING { color: var(--warn); }
   .events .ERROR { color: var(--bad); }
@@ -142,7 +142,7 @@
         </table>
       </div>
       <div class="row">
-        <span class="muted">Groups (one IP each, <span id="bpp">–</span> bots per group)</span>
+        <span class="muted">Groups (one IP each, <span id="bpp">–</span> per group)</span>
         <input type="number" id="groups-input" min="1" max="50">
         <button class="primary" id="groups-set">Set</button>
       </div>
@@ -288,7 +288,7 @@ function renderProxies() {
     <td>${p.groups.length ? "group " + p.groups.join(", ") : '<span class="muted">unused</span>'}</td>
     <td>${p.benched_until ? `<span class="pill s-connecting">benched ${ago(p.benched_until - now())}</span>` : '<span class="pill s-playing">ok</span>'}</td>
   </tr>`).join("") || '<tr><td colspan="4" class="muted">No proxies.</td></tr>';
-  $("bpp").textContent = state.bots_per_proxy;
+  $("bpp").textContent = state.bots_per_proxy + (state.bots_per_proxy === 1 ? " bot" : " bots");
   if (!editingGroups) $("groups-input").value = state.groups;
 }
 
