@@ -15,6 +15,7 @@ Run it with `python3 coordinator.py` (`python3 bot.py` does the same).
 """
 
 import argparse
+import base64
 import json
 import logging
 import math
@@ -24,6 +25,8 @@ import os
 import random
 import re
 import signal
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -46,6 +49,90 @@ DEFAULT_GROUPS = 3
 DEFAULT_STAGGER_INTERVAL = 3.0       # Seconds between each bot in a group connecting
 DEFAULT_PROXY_CHECK_INTERVAL = 60.0  # Seconds between Webshare checks for rotated IPs
 BAD_PROXY_COOLDOWN = 30 * 60         # Seconds a bad proxy is left out of the rotation
+
+GAME_WS_HOST = "51-91-214-104.powerline.io"
+GAME_WS_PORT = 9187
+GAME_WS_PATH = "/_/db1fa2b8"
+
+
+def probe_proxy_handshake(
+    proxy: dict,
+    target_host: str = GAME_WS_HOST,
+    target_port: int = GAME_WS_PORT,
+    path: str = GAME_WS_PATH,
+    timeout: float = 6.0,
+) -> Tuple[bool, str]:
+    """Test if a proxy can complete the WebSocket handshake with the Powerline game server.
+    Returns (True, 'HTTP/1.1 101 Switching Protocols') if clean, or (False, reason) if blocked."""
+    host = proxy.get("host", "")
+    port = int(proxy.get("port", 0))
+    user = proxy.get("user", "")
+    passwd = proxy.get("pass", "")
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    ss = None
+    try:
+        s.connect((host, port))
+        auth_bytes = f"{user}:{passwd}".encode("utf-8")
+        auth_header = (
+            f"Proxy-Authorization: Basic {base64.b64encode(auth_bytes).decode('ascii')}\r\n"
+            if user
+            else ""
+        )
+        connect_req = (
+            f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{target_port}\r\n"
+            f"{auth_header}"
+            f"User-Agent: Mozilla/5.0\r\n"
+            f"Proxy-Connection: Keep-Alive\r\n\r\n"
+        )
+        s.sendall(connect_req.encode("utf-8"))
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        status_line = resp.split(b"\r\n")[0].decode("utf-8", errors="replace")
+        if not any(ok in status_line for ok in ("200 Connection established", "200 OK")):
+            return False, f"Proxy CONNECT failed: {status_line}"
+
+        ctx = ssl.create_default_context()
+        ss = ctx.wrap_socket(s, server_hostname=target_host)
+        ws_req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {target_host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Origin: https://powerline.io\r\n"
+            f"User-Agent: Mozilla/5.0\r\n\r\n"
+        )
+        ss.sendall(ws_req.encode("utf-8"))
+        ws_resp = b""
+        while b"\r\n\r\n" not in ws_resp:
+            chunk = ss.recv(4096)
+            if not chunk:
+                break
+            ws_resp += chunk
+        ws_status = ws_resp.split(b"\r\n")[0].decode("utf-8", errors="replace")
+        if "101" in ws_status:
+            return True, ws_status
+        return False, ws_status
+    except Exception as e:
+        return False, f"Handshake error: {e}"
+    finally:
+        if ss:
+            try:
+                ss.close()
+            except Exception:
+                pass
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def proxy_key(proxy: Dict[str, str]) -> Tuple[str, str]:
@@ -148,6 +235,66 @@ class WebshareManager:
         if valid:
             self.proxies = valid
             logger.info(f"[Webshare] Fetched {len(valid)} active proxies from API.")
+        return self.proxies
+
+    def replace_proxies(self, bad_ips: List[str], dry_run: bool = False) -> Optional[int]:
+        """Request replacement of specific bad IPs via Webshare API v3."""
+        if not bad_ips or not self.api_key:
+            return None
+        ips = [ip.strip() for ip in bad_ips if ip.strip()]
+        if not ips:
+            return None
+        payload = {
+            "to_replace": {"type": "ip_range", "ip_ranges": [f"{ip}/32" for ip in ips]},
+            "replace_with": [{"type": "any"} for _ in ips],
+            "dry_run": dry_run,
+        }
+        url = "https://proxy.webshare.io/api/v3/proxy/replace/"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Token {self.api_key}", "Content-Type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                order_id = data.get("id")
+                logger.info(f"[Webshare] Replacement requested for {len(ips)} IPs (order #{order_id}).")
+                return order_id
+        except Exception as e:
+            logger.warning(f"[Webshare] Replacement request failed: {e}")
+            return None
+
+    def wait_for_replacement(self, replace_id: int, timeout: float = 60.0, poll_interval: float = 2.0) -> bool:
+        """Poll Webshare API v3 until replacement order completes."""
+        url = f"https://proxy.webshare.io/api/v3/proxy/replace/{replace_id}/"
+        headers = {"Authorization": f"Token {self.api_key}"}
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                state = data.get("state")
+                if state == "completed":
+                    logger.info(f"[Webshare] Replacement order #{replace_id} completed successfully.")
+                    return True
+                if state in ("failed", "rejected", "cancelled"):
+                    logger.warning(f"[Webshare] Replacement order #{replace_id} {state}: {data.get('error') or data.get('reason')}")
+                    return False
+            except Exception as e:
+                logger.debug(f"[Webshare] Polling replacement order #{replace_id}: {e}")
+            time.sleep(poll_interval)
+        logger.warning(f"[Webshare] Replacement order #{replace_id} timed out after {timeout}s.")
+        return False
+
+    def replace_and_refresh(self, bad_ips: List[str]) -> List[Dict[str, str]]:
+        """Replace bad IPs via Webshare API v3 and fetch the fresh proxy list."""
+        order_id = self.replace_proxies(bad_ips)
+        if order_id is not None:
+            if self.wait_for_replacement(order_id):
+                return self.fetch_proxies()
         return self.proxies
 
 
@@ -306,6 +453,9 @@ class Coordinator:
         self.bot_history: deque = deque(maxlen=HISTORY_POINTS)  # [time, running, playing]
         self.recent_alerts: deque = deque(maxlen=50)  # Past events worth an alert: {"time", "key", "level", "text"}
         self.next_proxy_check = 0.0
+        self.auto_replace: bool = getattr(args, "auto_replace", True)
+        self._replacing_ips: Set[str] = set()
+        self._replace_lock = threading.Lock()
         self.data_lock = threading.Lock()  # Guards logs/history, which the web server thread reads
         events_handler = logging.Handler()
         events_handler.emit = lambda record: self.events.append(
@@ -596,6 +746,93 @@ class Coordinator:
         if self.proxy_mgr.fetch_proxies():
             self.apply_proxies()
 
+    def _is_real_ip(self, host: str) -> bool:
+        if not host:
+            return False
+        parts = host.split(".")
+        return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+    def probe_proxies(self, proxies: Optional[List[dict]] = None) -> List[dict]:
+        """Probe proxies for Powerline WebSocket handshake and bench failing ones."""
+        to_probe = self.proxy_mgr.proxies if proxies is None else proxies
+        if not to_probe:
+            return []
+        import concurrent.futures
+        bad = []
+
+        def _check(p):
+            ok, reason = probe_proxy_handshake(p)
+            return p, ok, reason
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(to_probe)))) as ex:
+            results = list(ex.map(_check, to_probe))
+
+        for p, ok, reason in results:
+            if not ok:
+                bad.append(p)
+                self.bad_until[proxy_key(p)] = time.time() + BAD_PROXY_COOLDOWN
+                logger.warning(f"[Coordinator] Proxy {p['host']}:{p['port']} flagged by game server: {reason}")
+        return bad
+
+    def clean_flagged_proxies(self, max_rounds: int = 5) -> int:
+        """Scan proxy pool and rotate flagged IPs via Webshare API v3 until clean."""
+        if not self.proxy_mgr.proxies:
+            self.proxy_mgr.fetch_proxies()
+        if not self.proxy_mgr.proxies:
+            return 0
+
+        replaced_count = 0
+        for r in range(1, max_rounds + 1):
+            bad = self.probe_proxies()
+            if not bad:
+                logger.info(f"[Coordinator] All {len(self.proxy_mgr.proxies)} proxies verified clean (0 flagged).")
+                break
+            bad_ips = [p["host"] for p in bad if self._is_real_ip(p["host"])]
+            if not bad_ips:
+                logger.info("[Coordinator] No replaceable public IPs among flagged proxies.")
+                break
+            logger.info(
+                f"[Coordinator] Round {r}/{max_rounds}: replacing {len(bad_ips)} flagged IPs via Webshare API v3..."
+            )
+            new_list = self.proxy_mgr.replace_and_refresh(bad_ips)
+            replaced_count += len(bad_ips)
+            if new_list:
+                for p in new_list:
+                    self.bad_until.pop(proxy_key(p), None)
+                self.apply_proxies()
+            else:
+                break
+
+        return replaced_count
+
+    def auto_replace_proxy_async(self, bad_ip: str):
+        """Asynchronously replace a single bad proxy via Webshare API v3 and rotate group."""
+        if not self.auto_replace or not getattr(self.args, "webshare_key", None):
+            return
+        if not self._is_real_ip(bad_ip):
+            return
+        with self._replace_lock:
+            if bad_ip in self._replacing_ips:
+                return
+            self._replacing_ips.add(bad_ip)
+
+        def _worker():
+            try:
+                logger.info(f"[Coordinator] Starting automatic Webshare API v3 rotation for flagged IP {bad_ip}...")
+                new_list = self.proxy_mgr.replace_and_refresh([bad_ip])
+                if new_list:
+                    logger.info(f"[Coordinator] Successfully rotated {bad_ip}. Applying updated proxy pool.")
+                    for p in new_list:
+                        self.bad_until.pop(proxy_key(p), None)
+                    self.apply_proxies()
+            except Exception as e:
+                logger.warning(f"[Coordinator] Auto-replacement failed for {bad_ip}: {e}")
+            finally:
+                with self._replace_lock:
+                    self._replacing_ips.discard(bad_ip)
+
+        threading.Thread(target=_worker, daemon=True, name=f"autoreplace-{bad_ip}").start()
+
     def handle_exits(self):
         """Restart bots whose worker exited, on their group's current proxy and with the same name."""
         for agent in list(self.agents):
@@ -621,6 +858,8 @@ class Coordinator:
                         + (" (its group has already moved)." if moved else " and moving its group.")
                     )
                     self.bad_until[proxy_key(bad)] = time.time() + BAD_PROXY_COOLDOWN
+                    if self.auto_replace and bad.get("host"):
+                        self.auto_replace_proxy_async(bad["host"])
                     if time.time() - self.last_fetch >= MIN_REFETCH_INTERVAL:
                         # Failing proxies usually mean Webshare just rotated: pick up the new list now.
                         self.check_proxies()
@@ -974,7 +1213,9 @@ class Coordinator:
             logger.warning(
                 f"[Coordinator] Only {len(self.proxy_mgr.proxies)} proxies for {self.groups} groups; some groups share an IP."
             )
-        self.group_proxies = reassign_proxies([None] * self.groups, self.proxy_mgr.proxies)
+        if getattr(self.args, "clean_proxies", False):
+            self.clean_flagged_proxies()
+        self.group_proxies = reassign_proxies([None] * self.groups, self.usable_proxies())
         self.proxy_mgr.fetch_refresh_frequency()
 
         signal.signal(signal.SIGINT, self.shutdown)
@@ -1085,6 +1326,18 @@ def main():
         help="Start with every bot stopped, to be started from the dashboard (useful when started at boot)",
     )
     parser.add_argument("--local-max-bots", type=int, help="Never run more than this many bots on this machine")
+    parser.add_argument(
+        "--clean-proxies",
+        action="store_true",
+        help="Probe all Webshare proxies on startup and auto-rotate any flagged IPs via Webshare API v3.",
+    )
+    parser.add_argument(
+        "--no-auto-replace",
+        dest="auto_replace",
+        action="store_false",
+        default=True,
+        help="Disable automatic Webshare API v3 rotation when a proxy is reported bad.",
+    )
     args = parser.parse_args()
 
     if not args.webshare_key:

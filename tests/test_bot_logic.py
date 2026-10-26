@@ -269,6 +269,43 @@ class RunExitCodeTest(unittest.TestCase):
         with mock.patch.object(b, "run_session", return_value=BAD_PROXY_EXIT):
             self.assertEqual(b.run(), BAD_PROXY_EXIT)
 
+    def test_setup_page_detects_websocket_socketerror(self):
+        b = make_bot()
+        handlers = {}
+        class MockPage:
+            def on(self, event, handler):
+                handlers[event] = handler
+
+        mock_page = MockPage()
+        b.setup_page(mock_page)
+
+        class MockWS:
+            def on(self, event, handler):
+                if event == "socketerror":
+                    handler("WebSocket error: 400 Bad Request")
+
+        handlers["websocket"](MockWS())
+        self.assertTrue(b.ws_blocked)
+        self.assertIn("400 Bad Request", b.ws_blocked_reason)
+
+    def test_setup_page_detects_http_400_response(self):
+        b = make_bot()
+        handlers = {}
+        class MockPage:
+            def on(self, event, handler):
+                handlers[event] = handler
+
+        mock_page = MockPage()
+        b.setup_page(mock_page)
+
+        class MockResp:
+            status = 400
+            url = "https://51-91-214-104.powerline.io:9187/_/db1fa2b8"
+
+        handlers["response"](MockResp())
+        self.assertTrue(b.ws_blocked)
+        self.assertIn("HTTP 400", b.ws_blocked_reason)
+
 
 @unittest.skipIf(sys.platform == "win32", "uses a POSIX shell")
 class ProcessCleanupTest(unittest.TestCase):

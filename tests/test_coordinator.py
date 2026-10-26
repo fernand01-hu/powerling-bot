@@ -140,6 +140,35 @@ class WebshareTest(unittest.TestCase):
         self.assertEqual(mgr.next_rotation(1301), 1600)  # Missed rotation: the one after
         self.assertEqual(mgr.next_rotation(900), 1300)   # Clock skew never gives a past time
 
+    def test_replace_proxies_posts_to_v3_endpoint(self):
+        seen_reqs = []
+        def urlopen(req, timeout=None):
+            seen_reqs.append(req)
+            return fake_response({"id": 12345, "state": "validating"})
+
+        mgr = WebshareManager("secret_key")
+        with mock.patch("coordinator.urllib.request.urlopen", urlopen):
+            order_id = mgr.replace_proxies(["1.2.3.4", "5.6.7.8"])
+
+        self.assertEqual(order_id, 12345)
+        self.assertEqual(len(seen_reqs), 1)
+        self.assertEqual(seen_reqs[0].full_url, "https://proxy.webshare.io/api/v3/proxy/replace/")
+        self.assertEqual(seen_reqs[0].get_header("Authorization"), "Token secret_key")
+        body = json.loads(seen_reqs[0].data.decode())
+        self.assertEqual(body["to_replace"]["ip_ranges"], ["1.2.3.4/32", "5.6.7.8/32"])
+
+    def test_wait_for_replacement_polls_until_completed(self):
+        mgr = WebshareManager("secret_key")
+        responses = [
+            fake_response({"state": "processing"}),
+            fake_response({"state": "completed"}),
+        ]
+        with mock.patch("coordinator.urllib.request.urlopen", side_effect=responses), \
+             mock.patch("coordinator.time.sleep", return_value=None):
+            done = mgr.wait_for_replacement(12345, timeout=10, poll_interval=0.01)
+
+        self.assertTrue(done)
+
 
 class FuzzTest(unittest.TestCase):
     def test_reassign_proxies_rules(self):
@@ -382,6 +411,34 @@ class AgentLifecycleTest(unittest.TestCase):
             coord.shutdown()
         self.assertEqual(a.running, {})
         self.assertEqual(b.running, {})
+
+    def test_probe_proxies_benches_failed_handshake(self):
+        coord = make(FakeAgent("a"), groups=1, bpp=1, proxies=("192.168.1.1", "192.168.1.2"))
+        with mock.patch("coordinator.probe_proxy_handshake", side_effect=[(True, "101"), (False, "400 Bad Request")]):
+            bad = coord.probe_proxies(coord.proxy_mgr.proxies)
+
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]["host"], "192.168.1.2")
+        self.assertIn(("192.168.1.2", "8080"), coord.bad_until)
+
+    def test_clean_flagged_proxies_rotates_and_applies(self):
+        coord = make(FakeAgent("a"), groups=1, bpp=1, proxies=("192.168.1.1",))
+        with mock.patch.object(coord, "probe_proxies", side_effect=[[proxy("192.168.1.1")], []]), \
+             mock.patch.object(coord.proxy_mgr, "replace_and_refresh", return_value=[proxy("192.168.1.99")]), \
+             mock.patch.object(coord, "apply_proxies") as mock_apply:
+            count = coord.clean_flagged_proxies(max_rounds=2)
+
+        self.assertEqual(count, 1)
+        mock_apply.assert_called()
+
+    def test_auto_replace_proxy_async_triggers_thread(self):
+        coord = make(FakeAgent("a"), groups=1, bpp=1, proxies=("192.168.1.1",))
+        replaced = []
+        with mock.patch.object(coord.proxy_mgr, "replace_and_refresh", side_effect=lambda ips: replaced.extend(ips)):
+            coord.auto_replace_proxy_async("192.168.1.1")
+            time.sleep(0.1)
+
+        self.assertEqual(replaced, ["192.168.1.1"])
 
 
 class RemoteAgentTest(unittest.TestCase):

@@ -289,6 +289,57 @@ class PowerlineBot:
         self.rounds = 0
         self.last_respawn: Optional[float] = None
         self.screenshot_wanted = False
+        self.ws_blocked = False
+        self.ws_blocked_reason = ""
+
+    def setup_page(self, page):
+        """Hook page events to immediately catch blocked proxies, WebSocket 400 errors, or HTTP 407."""
+        self.ws_blocked = False
+        self.ws_blocked_reason = ""
+        if not hasattr(page, "on"):
+            return
+
+        def _on_ws(ws):
+            def _on_err(err):
+                err_str = str(err)
+                logger.warning(f"{self.log_prefix} WebSocket error: {err_str}")
+                if any(code in err_str for code in ("400", "403", "407", "Bad Request", "Forbidden")):
+                    self.ws_blocked = True
+                    self.ws_blocked_reason = f"WebSocket error: {err_str}"
+            try:
+                ws.on("socketerror", _on_err)
+            except Exception:
+                pass
+
+        def _on_resp(resp):
+            try:
+                status = resp.status
+                if status in (400, 403, 407):
+                    url = resp.url
+                    # Ignore Cloudflare challenge scripts / asset probes
+                    if "challenges.cloudflare" not in url and ("powerline.io" in url or "/_/" in url):
+                        logger.warning(f"{self.log_prefix} HTTP {status} response on {url}")
+                        self.ws_blocked = True
+                        self.ws_blocked_reason = f"HTTP {status} on {url}"
+            except Exception:
+                pass
+
+        def _on_req_failed(req):
+            try:
+                err = req.failure or ""
+                if any(k in err.upper() for k in ("PROXY", "REFUSED", "RESET")):
+                    logger.warning(f"{self.log_prefix} Network request failed: {req.url} ({err})")
+                    self.ws_blocked = True
+                    self.ws_blocked_reason = f"Network failure: {err}"
+            except Exception:
+                pass
+
+        try:
+            page.on("websocket", _on_ws)
+            page.on("response", _on_resp)
+            page.on("requestfailed", _on_req_failed)
+        except Exception as e:
+            logger.warning(f"{self.log_prefix} Failed to attach page monitors: {e}")
 
     def set_state(self, state: str, force: bool = False):
         """Report the bot's state (loading, connecting, lobby, playing, dead); at most every
@@ -390,15 +441,20 @@ class PowerlineBot:
         except Exception as e:
             logger.warning(f"{self.log_prefix} Navigation warning: {e}")
         # Wait up to 30s for the lobby, a second at a time, answering the dashboard (screenshots)
-        # and noticing a stop or a new proxy meanwhile.
+        # and noticing a stop, a new proxy, or a blocked WebSocket connection meanwhile.
         deadline = time.time() + 30
         while True:
+            if self.ws_blocked:
+                logger.warning(
+                    f"{self.log_prefix} Game server connection blocked ({self.ws_blocked_reason}); aborting lobby wait."
+                )
+                break
             try:
                 page.wait_for_selector("#nick", state="visible", timeout=1000)
                 break
             except Exception:
-                if self.poll_proxy_update():
-                    break  # The caller switches to the new proxy
+                if self.ws_blocked or self.poll_proxy_update():
+                    break  # The caller switches to the new proxy or exits on bad proxy
                 self.serve_screenshot(page)
                 if time.time() >= deadline:
                     logger.warning(f"{self.log_prefix} Lobby didn't appear within 30s, continuing anyway.")
@@ -488,6 +544,7 @@ class PowerlineBot:
             f"({proxy_info.get('country')}), refreshing the page..."
         )
         new_page = browser.new_page(proxy=to_playwright_proxy(proxy_info))
+        self.setup_page(new_page)
         self.open_game(new_page)
         try:
             page.context.close()
@@ -534,6 +591,7 @@ class PowerlineBot:
             proxy=proxy_opt,
         ) as browser:
             page = browser.new_page()
+            self.setup_page(page)
             # Mouse coordinates are relative to the viewport, which is smaller than the window.
             try:
                 viewport = tuple(page.evaluate("() => [window.innerWidth, window.innerHeight]"))
@@ -542,6 +600,11 @@ class PowerlineBot:
             self.humanizer = Humanizer(page=page, window_size=viewport)
             h = self.humanizer
             self.open_game(page)
+            if self.ws_blocked and not self.reached_game:
+                logger.warning(
+                    f"{self.log_prefix} Proxy {self.proxy['host'] if self.proxy else 'direct'} was blocked by game server ({self.ws_blocked_reason}); exiting."
+                )
+                return BAD_PROXY_EXIT
 
             # Natural post-navigation dwell with ambient drift
             h.sleep(2.5, 0.3, 0.5, min_floor=1.8)
@@ -555,6 +618,16 @@ class PowerlineBot:
                     page = self.switch_proxy(browser, page)
                     died_at = None
                     self.reached_game, failed_reloads, seen_game = False, 0, False
+                if self.ws_blocked and not self.reached_game:
+                    if self.poll_proxy_update():
+                        page = self.switch_proxy(browser, page)
+                        died_at = None
+                        self.reached_game, failed_reloads, seen_game = False, 0, False
+                        continue
+                    logger.warning(
+                        f"{self.log_prefix} Proxy {self.proxy['host'] if self.proxy else 'direct'} was blocked by game server ({self.ws_blocked_reason}); exiting."
+                    )
+                    return BAD_PROXY_EXIT
                 self.serve_screenshot(page)
 
                 # 1. Dismiss popups / consent
@@ -630,7 +703,7 @@ class PowerlineBot:
                         except Exception as e:
                             logger.warning(f"{self.log_prefix} Page reload failed ({e}); restarting the browser.")
                             # A proxy that now refuses connections was most likely rotated out by Webshare.
-                            return BAD_PROXY_EXIT if "PROXY" in str(e).upper() else None
+                            return BAD_PROXY_EXIT if ("PROXY" in str(e).upper() or self.ws_blocked) else None
                         continue
 
                     h.sleep(0.3, 0.05, 0.08, min_floor=0.15)

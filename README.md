@@ -2,6 +2,8 @@
 
 Runs several Camoufox (anti-detect Firefox) browser instances that join a powerline.io room and play continuously, using Webshare proxies.
 
+**Full guide (setup, dashboard, troubleshooting): [GUIDE.md](GUIDE.md)**
+
 ## How it works
 
 1. **Coordinator** (`coordinator.py`): splits the bots into `--groups` groups of `--bots-per-proxy` bots, each group on its own proxy IP, and gives every bot one random nickname for the whole run. It places each bot on an agent (the one running the fewest bots per CPU core) and restarts bots whose worker exits, with the same name, on their group's current proxy. All browsers stay open until you stop it. Every `--proxy-check-interval` seconds it re-reads the proxy list (all pages) from Webshare: a group keeps its proxy while it's still listed, and when Webshare rotates it out the group moves to an unused proxy and its bots are told to switch. A proxy that can't reach the game (the browser can't launch through it, or the page stays on "Connecting..." through two reloads) is benched for 30 minutes and its group is moved the same way.
@@ -125,7 +127,7 @@ It starts when you log in and restarts the agent if it ever exits (log: `agent.l
 python3 -m unittest discover -s tests
 ```
 
-178 tests (about 15s) that need no browser, no Webshare account and no internet: fake pages, browsers, agents and Webshare responses stand in for the real ones (`tests/fakes.py`). They cover:
+222 tests (about 18s) that need no browser, no Webshare account and no internet: fake pages, browsers, agents and Webshare responses stand in for the real ones (`tests/fakes.py`). They cover:
 
 - **humanizer**: timing distributions, mouse paths (always end on target, no jumps, overshoot rules), click spots inside buttons, typing (typos always corrected), idle drift, fatigue, watchdog
 - **bot**: names, steering odds, status reports and throttling, proxy updates and the stop message, page loading, proxy switching, the respawn loop, exit codes, process-tree clean-up
