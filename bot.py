@@ -314,7 +314,8 @@ class PowerlineBot:
         def _on_resp(resp):
             try:
                 status = resp.status
-                if status in (400, 403, 407):
+                # Note: 407 is standard proxy authentication challenge; do not abort on it
+                if status in (400, 403):
                     url = resp.url
                     # Ignore Cloudflare challenge scripts / asset probes
                     if "challenges.cloudflare" not in url and ("powerline.io" in url or "/_/" in url):
