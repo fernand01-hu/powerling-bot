@@ -175,11 +175,29 @@ class EzSolver:
             # If already in the active gameplay arena, challenge is passed
             in_arena = page.evaluate("""
                 (() => {
+                    const isVis = (el) => {
+                        if (!el || el.hidden) return false;
+                        if (el.style && (el.style.display === 'none' || el.style.visibility === 'hidden')) return false;
+                        return el.offsetParent !== null;
+                    };
                     const canvas = document.getElementById('xcanvas');
-                    const nick = document.getElementById('nick');
-                    const death = document.getElementById('deathPlayAgain');
-                    const isVis = (el) => !!el && !el.hidden && el.style.display !== 'none' && el.offsetParent !== null;
-                    return !!canvas && !isVis(nick) && !isVis(death);
+                    if (!canvas) return false;
+
+                    // Cannot be in active arena if any lobby/death/connecting/error elements are visible
+                    if (isVis(document.getElementById('deathPlayAgain'))) return false;
+                    if (isVis(document.getElementById('topGuiConnecting'))) return false;
+                    if (isVis(document.getElementById('nick'))) return false;
+                    if (isVis(document.getElementById('captchaFailed'))) return false;
+                    if (isVis(document.getElementById('roomTimeout'))) return false;
+                    if (isVis(document.getElementById('roomFailed'))) return false;
+
+                    const stats = document.getElementById('statsPanel');
+                    if (stats && !stats.hidden && stats.style.display !== 'none') return false;
+
+                    const topGui = document.getElementById('topGui');
+                    if (topGui && !topGui.hidden && topGui.style.display !== 'none') return false;
+
+                    return true;
                 })()
             """)
             if in_arena:
@@ -403,19 +421,22 @@ class PowerlineBot:
         try:
             page.evaluate("""
                 (() => {
-                    const qc = document.getElementById('qc-cmp2-container') || document.querySelector('.qc-cmp2-container');
-                    if (qc) qc.remove();
-                    const qcUi = document.querySelector('.qc-cmp2-ui');
-                    if (qcUi) qcUi.remove();
-                    document.body.classList.remove('qc-cmp2-showing');
                     const buttons = Array.from(document.querySelectorAll('button'));
                     for (const b of buttons) {
-                        const t = b.innerText.trim().toUpperCase();
+                        const t = (b.innerText || '').trim().toUpperCase();
                         if (t === 'AGREE' || t === 'ACCEPT ALL' || t === 'I AGREE' || t === 'ACCEPT') {
                             b.click();
                             break;
                         }
                     }
+                    const disagree = document.getElementById('disagree-btn');
+                    if (disagree) disagree.click();
+
+                    const qc = document.getElementById('qc-cmp2-container') || document.querySelector('.qc-cmp2-container');
+                    if (qc) qc.remove();
+                    const qcUi = document.getElementById('qc-cmp2-ui') || document.querySelector('.qc-cmp2-ui');
+                    if (qcUi) qcUi.remove();
+                    document.body.classList.remove('qc-cmp2-showing');
                 })()
             """)
         except Exception:
