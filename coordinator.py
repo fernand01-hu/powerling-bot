@@ -135,13 +135,17 @@ def probe_proxy_handshake(
             pass
 
 
-def proxy_key(proxy: Dict[str, str]) -> Tuple[str, str]:
-    return proxy["host"], proxy["port"]
+def proxy_key(proxy: Optional[Dict[str, str]]) -> Tuple[str, str]:
+    if not proxy:
+        return ("direct", "0")
+    return proxy.get("host", "direct"), str(proxy.get("port", "0"))
 
 
-def reassign_proxies(current: List[Optional[Dict[str, str]]], available: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def reassign_proxies(current: List[Optional[Dict[str, str]]], available: List[Dict[str, str]]) -> List[Optional[Dict[str, str]]]:
     """Keep each group on its proxy while it's still available and not carrying more than its share
     of groups; every other group moves to the least-used proxy, so groups stay spread out."""
+    if not available:
+        return [None] * len(current)
     by_key = {proxy_key(p): p for p in available}
     share = -(-len(current) // len(available))  # Most groups any one proxy should carry (ceil)
     load = {k: 0 for k in by_key}
@@ -456,6 +460,11 @@ class Coordinator:
         self.auto_replace: bool = getattr(args, "auto_replace", True)
         self._replacing_ips: Set[str] = set()
         self._replace_lock = threading.Lock()
+        self._replace_queue: queue.Queue = queue.Queue()
+        self._last_replace_time: float = 0.0
+        self._replace_cooldown: float = 60.0  # Minimum seconds between Webshare API replacement requests
+        if self.auto_replace and getattr(args, "webshare_key", None):
+            threading.Thread(target=self._replace_worker_loop, daemon=True, name="autoreplace-worker").start()
         self.data_lock = threading.Lock()  # Guards logs/history, which the web server thread reads
         events_handler = logging.Handler()
         events_handler.emit = lambda record: self.events.append(
@@ -733,9 +742,9 @@ class Coordinator:
         new = reassign_proxies(self.group_proxies, self.usable_proxies())
         for g, (old, cur) in enumerate(zip(self.group_proxies, new)):
             if proxy_key(old) != proxy_key(cur):
-                logger.info(
-                    f"[Coordinator] Group {g} IP rotated: {old['host']}:{old['port']} -> {cur['host']}:{cur['port']}"
-                )
+                old_desc = f"{old['host']}:{old['port']}" if old else "direct"
+                cur_desc = f"{cur['host']}:{cur['port']}" if cur else "direct"
+                logger.info(f"[Coordinator] Group {g} IP rotated: {old_desc} -> {cur_desc}")
                 for bot_id in self.group_bots(g):
                     if bot_id in self.bot_agent:
                         self.bot_agent[bot_id].update_proxy(bot_id, cur)
@@ -805,8 +814,46 @@ class Coordinator:
 
         return replaced_count
 
+    def _replace_worker_loop(self):
+        """Worker thread that consumes flagged IPs, batches them, and respects rate limits."""
+        while True:
+            try:
+                bad_ip = self._replace_queue.get()
+                batch = [bad_ip]
+                # Collect up to 4 more pending IPs to replace in a single batch
+                while len(batch) < 5:
+                    try:
+                        extra = self._replace_queue.get_nowait()
+                        if extra not in batch and self._is_real_ip(extra):
+                            batch.append(extra)
+                    except queue.Empty:
+                        break
+
+                # Enforce minimum cooldown between Webshare API requests to prevent HTTP 429
+                elapsed = time.time() - self._last_replace_time
+                if elapsed < self._replace_cooldown:
+                    time.sleep(self._replace_cooldown - elapsed)
+
+                logger.info(f"[Coordinator] Batch replacement requested for {len(batch)} IP(s): {', '.join(batch)}...")
+                new_list = self.proxy_mgr.replace_and_refresh(batch)
+                self._last_replace_time = time.time()
+                if new_list:
+                    logger.info(f"[Coordinator] Successfully rotated {len(batch)} IP(s). Applying updated proxy pool.")
+                    for p in new_list:
+                        self.bad_until.pop(proxy_key(p), None)
+                    self.apply_proxies()
+            except Exception as e:
+                logger.warning(f"[Coordinator] Auto-replacement batch failed: {e}")
+                if "429" in str(e):
+                    logger.warning("[Coordinator] Rate limited (429) by Webshare API; backing off 60s...")
+                    time.sleep(60.0)
+            finally:
+                with self._replace_lock:
+                    for ip in batch:
+                        self._replacing_ips.discard(ip)
+
     def auto_replace_proxy_async(self, bad_ip: str):
-        """Asynchronously replace a single bad proxy via Webshare API v3 and rotate group."""
+        """Queue a bad proxy IP for batched, rate-limited Webshare API v3 rotation."""
         if not self.auto_replace or not getattr(self.args, "webshare_key", None):
             return
         if not self._is_real_ip(bad_ip):
@@ -815,23 +862,7 @@ class Coordinator:
             if bad_ip in self._replacing_ips:
                 return
             self._replacing_ips.add(bad_ip)
-
-        def _worker():
-            try:
-                logger.info(f"[Coordinator] Starting automatic Webshare API v3 rotation for flagged IP {bad_ip}...")
-                new_list = self.proxy_mgr.replace_and_refresh([bad_ip])
-                if new_list:
-                    logger.info(f"[Coordinator] Successfully rotated {bad_ip}. Applying updated proxy pool.")
-                    for p in new_list:
-                        self.bad_until.pop(proxy_key(p), None)
-                    self.apply_proxies()
-            except Exception as e:
-                logger.warning(f"[Coordinator] Auto-replacement failed for {bad_ip}: {e}")
-            finally:
-                with self._replace_lock:
-                    self._replacing_ips.discard(bad_ip)
-
-        threading.Thread(target=_worker, daemon=True, name=f"autoreplace-{bad_ip}").start()
+        self._replace_queue.put(bad_ip)
 
     def handle_exits(self):
         """Restart bots whose worker exited, on their group's current proxy and with the same name."""
@@ -852,14 +883,16 @@ class Coordinator:
                     current = self.group_proxies[bot_id // self.args.bots_per_proxy]
                     bad = event.get("proxy") or current
                     moved = proxy_key(bad) != proxy_key(current)
+                    bad_desc = f"{bad['host']}:{bad['port']}" if bad else "direct"
                     logger.warning(
-                        f"[Coordinator] Bot #{bot_id} reports proxy {bad['host']}:{bad['port']} can't reach the game; "
+                        f"[Coordinator] Bot #{bot_id} reports proxy {bad_desc} can't reach the game; "
                         f"benching it for {BAD_PROXY_COOLDOWN // 60} min"
                         + (" (its group has already moved)." if moved else " and moving its group.")
                     )
-                    self.bad_until[proxy_key(bad)] = time.time() + BAD_PROXY_COOLDOWN
-                    if self.auto_replace and bad.get("host"):
-                        self.auto_replace_proxy_async(bad["host"])
+                    if bad:
+                        self.bad_until[proxy_key(bad)] = time.time() + BAD_PROXY_COOLDOWN
+                        if self.auto_replace and bad.get("host"):
+                            self.auto_replace_proxy_async(bad["host"])
                     if time.time() - self.last_fetch >= MIN_REFETCH_INTERVAL:
                         # Failing proxies usually mean Webshare just rotated: pick up the new list now.
                         self.check_proxies()
@@ -902,7 +935,8 @@ class Coordinator:
             self.groups = groups
             for g in new_groups:
                 proxy = self.group_proxies[g]
-                logger.info(f"[Coordinator] Added group {g} on {proxy['host']}:{proxy['port']}.")
+                p_desc = f"{proxy['host']}:{proxy['port']}" if proxy else "direct"
+                logger.info(f"[Coordinator] Added group {g} on {p_desc}.")
                 for k, bot_id in enumerate(self.group_bots(g)):
                     self.place_bot(bot_id, (k * self.args.stagger_interval) + random.uniform(1.0, 3.5))
         else:
@@ -1112,7 +1146,12 @@ class Coordinator:
             "machines": machines,
             "bots": bots,
             "group_proxies": [
-                {"group": g, "host": p["host"], "port": p["port"], "country": p.get("country")}
+                {
+                    "group": g,
+                    "host": p["host"] if p else "direct",
+                    "port": p["port"] if p else "0",
+                    "country": p.get("country", "local") if p else "local",
+                }
                 for g, p in enumerate(self.group_proxies)
             ],
             "proxies": [
@@ -1206,17 +1245,21 @@ class Coordinator:
 
     def run(self, wait_agents: float = 0.0, start_stopped: bool = False):
         args = self.args
-        while not self.proxy_mgr.fetch_proxies():
-            logger.error("[Coordinator] No proxies available from Webshare, retrying in 30s...")
-            time.sleep(30)
-        if len(self.proxy_mgr.proxies) < self.groups:
-            logger.warning(
-                f"[Coordinator] Only {len(self.proxy_mgr.proxies)} proxies for {self.groups} groups; some groups share an IP."
-            )
-        if getattr(self.args, "clean_proxies", False):
-            self.clean_flagged_proxies()
-        self.group_proxies = reassign_proxies([None] * self.groups, self.usable_proxies())
-        self.proxy_mgr.fetch_refresh_frequency()
+        if getattr(args, "direct", False) or not getattr(args, "webshare_key", None):
+            logger.info("[Coordinator] Running in direct connection mode (no proxies).")
+            self.group_proxies = [None] * self.groups
+        else:
+            while not self.proxy_mgr.fetch_proxies():
+                logger.error("[Coordinator] No proxies available from Webshare, retrying in 30s...")
+                time.sleep(30)
+            if len(self.proxy_mgr.proxies) < self.groups:
+                logger.warning(
+                    f"[Coordinator] Only {len(self.proxy_mgr.proxies)} proxies for {self.groups} groups; some groups share an IP."
+                )
+            if getattr(self.args, "clean_proxies", False):
+                self.clean_flagged_proxies()
+            self.group_proxies = reassign_proxies([None] * self.groups, self.usable_proxies())
+            self.proxy_mgr.fetch_refresh_frequency()
 
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
@@ -1231,7 +1274,8 @@ class Coordinator:
 
         for g in range(self.groups):
             proxy = self.group_proxies[g]
-            logger.info(f"[Coordinator] Group {g} on {proxy['host']}:{proxy['port']} ({args.bots_per_proxy} bots)")
+            p_desc = f"{proxy['host']}:{proxy['port']}" if proxy else "direct (local network)"
+            logger.info(f"[Coordinator] Group {g} on {p_desc} ({args.bots_per_proxy} bots)")
             if start_stopped:
                 continue
             for k, bot_id in enumerate(b for b in self.group_bots(g) if b not in self.stopped):
@@ -1338,10 +1382,15 @@ def main():
         default=True,
         help="Disable automatic Webshare API v3 rotation when a proxy is reported bad.",
     )
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="Run bots directly without proxies (uses clean local network IP)",
+    )
     args = parser.parse_args()
 
-    if not args.webshare_key:
-        parser.error("no Webshare API key: set WEBSHARE_API_KEY or pass --webshare-key")
+    if not args.direct and not args.webshare_key:
+        parser.error("no Webshare API key: set WEBSHARE_API_KEY or pass --webshare-key (or use --direct)")
     if args.groups < 1 or args.bots_per_proxy < 1 or args.proxy_check_interval <= 0:
         parser.error("--groups and --bots-per-proxy must be >= 1, --proxy-check-interval > 0")
     if args.no_local_agent and not args.listen:
