@@ -146,22 +146,22 @@ class Agent:
         if entry and entry[0].is_alive():
             entry[1].put(proxy)
 
-    def stop_bots(self, bot_ids: List[int], wait: bool = False):
+    def stop_bots(self, bot_ids: List[int], wait: bool = False, force: bool = False):
         """Stop bots and every browser process they started. Returns right away (poll() finishes
-        the clean-up, killing what's left after 8s) unless wait=True."""
+        the clean-up, killing what's left after 8s) unless wait=True. force=True kills them at once."""
         items = [(i, *self.workers.pop(i)) for i in bot_ids if i in self.workers]
-        deadline = time.time() + 8
+        deadline = time.time() + (0 if force else 8)
         for i, p, updates, home in items:
             self.bot_status.pop(i, None)
             # Record the worker's browser processes first: once a worker is killed, Windows has no
             # process group to find them by.
             tree = process_tree(p.pid)
-            if p.is_alive():
+            if p.is_alive() and not force:
                 updates.put(STOP_WORKER)  # Asks the worker to close its browser itself
                 if not IS_WINDOWS:
                     p.terminate()  # SIGTERM also unwinds it (on Windows this would be a hard kill)
             self.stopping.append((i, p, tree, home, deadline))
-        self.finish_stopping(wait)
+        self.finish_stopping(wait or force)
 
     def finish_stopping(self, wait: bool = False):
         """Clean up after stopped workers that have exited, or kill them once their deadline passes."""
@@ -286,7 +286,7 @@ class Agent:
         elif msg["type"] == "update_proxy":
             self.update_proxy(msg["bot"], msg["proxy"])
         elif msg["type"] == "stop":
-            self.stop_bots(msg["bots"])
+            self.stop_bots(msg["bots"], force=bool(msg.get("force")))
         elif msg["type"] == "stop_all":
             self.stop_all()
         elif msg["type"] == "set_max_bots":

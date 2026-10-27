@@ -265,11 +265,27 @@ Open `http://COORD_IP:4042` and log in with any user name and `POWERLINE_DASHBOA
 
 - **Overview**: every bot (loading / connecting / lobby / playing / dead, machine, group, IP, rounds, last respawn), every machine (CPU, RAM, bots), the proxies and a countdown to the next Webshare rotation.
 - **Alerts**: a machine disconnected or overloaded, bots waiting for room or failing repeatedly, all proxies benched, Webshare not answering.
-- **Bots**: stop, start or restart one bot, a selection or all of them; 📷 shows what a bot's browser is displaying.
-- **Machines**: pause/resume (its bots move elsewhere), set a bot limit, restart its agent (also loads updated code), stop its bots.
+- **Bots**: stop, start or restart one bot, a selection or all of them; 📷 shows what a bot's browser is displaying. **Kill all** force-closes every bot's browser at once instead of waiting up to 8 s for each to close itself.
+- **Machines**: pause/resume (its bots move elsewhere), set a bot limit (type it, then **Set** or Enter; Esc undoes), restart its agent (also loads updated code), stop or kill its bots.
+- **Add a machine**: ready-to-copy setup commands for Linux or Windows, already filled in with this coordinator's address.
 - **Last hour**: CPU and RAM per machine and bots running/playing.
 - **Live logs** from every machine and bot, filterable by machine, bot and level.
 - **Settings**: room code, bots per group, groups, proxy check interval, join stagger. Saved to the state file and kept after restarts.
+
+### From the command line
+
+`ctl.py` sends the same commands from a terminal (on the coordinator machine by default; `--dashboard HOST:PORT` for another one). It reads the password from `POWERLINE_DASHBOARD_PASSWORD` or `~/.config/powerline-bot/env`.
+
+```bash
+python3 ctl.py status                 # machines and bot states
+python3 ctl.py kill-all               # force-close every bot right now
+python3 ctl.py kill MACHINE-NAME      # only the bots on one machine
+python3 ctl.py stop-all               # graceful stop (bots close their browsers)
+python3 ctl.py stop MACHINE-NAME
+python3 ctl.py start-all
+```
+
+Killed and stopped bots stay stopped until you start them again.
 
 Saved settings (including per-machine bot limits set on the dashboard) override the command line. Bot names, paused machines and stopped bots are kept in `~/.config/powerline-bot/state.json` on the coordinator.
 
@@ -403,7 +419,7 @@ An agent still on old code shows `code version ... differs from the coordinator'
 python3 -m unittest discover -s tests
 ```
 
-222 tests (about 18 s) that need no browser, no Webshare account and no internet: fakes in `tests/fakes.py` stand in for pages, browsers, agents and Webshare. They cover the humanizer, bot logic, coordinator placement and proxy handling, the agent link and message format, and the dashboard.
+225 tests (about 18 s) that need no browser, no Webshare account and no internet: fakes in `tests/fakes.py` stand in for pages, browsers, agents and Webshare. They cover the humanizer, bot logic, coordinator placement and proxy handling, the agent link and message format, and the dashboard.
 
 ## Security notes
 

@@ -262,6 +262,22 @@ class BulkAndMachineTest(unittest.TestCase):
         self.assertEqual(self.a.running, {})
         self.assertTrue(set(alpha_bots) <= self.coord.stopped)
 
+    def test_kill_machine_bots_force_stops_only_that_machine(self):
+        alpha_bots = sorted(b for b, ag in self.coord.bot_agent.items() if ag is self.a)
+        self.coord.run_command({"action": "kill_machine_bots", "machine": "alpha"})
+        self.assertEqual(self.a.running, {})
+        self.assertIn(("kill", tuple(alpha_bots)), self.a.calls)
+        self.assertTrue(set(alpha_bots) <= self.coord.stopped)
+        self.assertFalse(any(c[0] == "kill" for c in self.b.calls))
+
+    def test_kill_all_force_stops_everything(self):
+        self.coord.run_command({"action": "kill_all"})
+        self.assertEqual(self.a.running, {})
+        self.assertEqual(self.b.running, {})
+        self.assertTrue(any(c[0] == "kill" for c in self.a.calls))
+        self.assertEqual(self.coord.stopped, set(range(self.coord.total)))
+        self.assertEqual(self.coord.bot_agent, {})
+
     def test_restart_local_machine_restarts_its_bots(self):
         before = sorted(self.a.running)
         self.coord.run_command({"action": "restart_machine", "machine": "alpha"})

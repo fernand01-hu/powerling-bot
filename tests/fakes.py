@@ -114,10 +114,10 @@ class FakeAgent:
             self.running[bot_id]["proxy"] = proxy
         self.calls.append(("update_proxy", bot_id, proxy["host"]))
 
-    def stop_bots(self, bot_ids, wait=False):
+    def stop_bots(self, bot_ids, wait=False, force=False):
         for b in bot_ids:
             self.running.pop(b, None)
-        self.calls.append(("stop", tuple(bot_ids)))
+        self.calls.append(("kill" if force else "stop", tuple(bot_ids)))
 
     def stop_all(self, wait=False):
         self.stop_bots(list(self.running))

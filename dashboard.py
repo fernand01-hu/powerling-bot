@@ -40,6 +40,7 @@ ACTIONS = {
     "stop_bot", "start_bot", "restart_bot", "stop_all", "start_all",
     "stop_bots", "start_bots", "restart_bots", "screenshot",
     "pause_machine", "resume_machine", "set_max_bots", "restart_machine", "stop_machine_bots",
+    "kill_all", "kill_machine_bots",
     "set_groups", "set_settings", "refresh_proxies",
 }
 MAX_BODY = 4096

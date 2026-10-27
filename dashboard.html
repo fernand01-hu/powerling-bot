@@ -84,6 +84,16 @@
     font: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px;
     background: var(--bg); color: var(--text); border: 1px solid var(--border); }
   input[type=number] { width: 70px; }
+  input.edited { border-color: var(--warn); }
+  .add-machine summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .add-machine ol { margin: 10px 0 0; padding-left: 20px; font-size: 13px; }
+  .add-machine li { margin: 10px 0; }
+  .add-machine .tabs { display: flex; gap: 6px; margin-top: 10px; }
+  .add-machine .tabs button[aria-pressed=true] { background: var(--accent-dim); border-color: var(--accent); }
+  .snippet { position: relative; margin-top: 6px; }
+  .snippet pre { margin: 0; padding: 10px 12px; padding-right: 64px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; overflow-x: auto; white-space: pre; }
+  .snippet button { position: absolute; top: 6px; right: 6px; }
   input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; vertical-align: middle; }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -169,12 +179,21 @@
   <section>
     <h2>Machines</h2>
     <div class="machines" id="machines"></div>
+    <details class="add-machine" id="add-machine">
+      <summary>Add a machine</summary>
+      <div class="tabs" role="group" aria-label="Operating system">
+        <button type="button" data-os="linux" aria-pressed="true">Linux</button>
+        <button type="button" data-os="windows" aria-pressed="false">Windows</button>
+      </div>
+      <ol id="add-steps"></ol>
+    </details>
   </section>
 
   <section>
     <h2>
       <span>Bots</span>
       <span class="row" style="margin:0">
+        <button class="danger" data-action="kill_all" title="Force-close every bot's browser at once, without waiting">Kill all</button>
         <button class="danger" data-action="stop_all">Stop all</button>
         <button data-action="start_all">Start all</button>
       </span>
@@ -275,8 +294,10 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 let state = null;
 let serverOffset = 0;  // Server clock minus browser clock, so countdowns match the coordinator
-let editingGroups = false;
 let settingsDirty = false;
+const drafts = new Map();  // Input key -> value typed but not sent yet; survives the 2s refreshes
+let pointerDown = false;   // A click in progress: redrawing its button now would swallow the click
+let addOs = "linux";
 const selected = new Set();
 const dismissed = new Map();  // Alert key -> text when dismissed (it comes back if the text changes)
 const machineColors = new Map();  // Machine name -> series slot, first seen first; never re-ranked
@@ -374,7 +395,7 @@ function renderRotation() {
 /* ---------- Machines ---------- */
 function renderMachines() {
   const el = $("machines");
-  if (el.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;  // Don't wipe a value being typed
+  if (pointerDown || (el.contains(document.activeElement) && document.activeElement.tagName === "INPUT")) return;  // Don't wipe a value being typed
   if (!state.machines.length) {
     el.innerHTML = '<div class="muted">No machines connected.</div>';
     return;
@@ -382,7 +403,8 @@ function renderMachines() {
   el.innerHTML = state.machines.map((m) => {
     const cpuClass = m.cpu >= 85 ? "hot" : m.cpu >= 65 ? "warm" : "";
     const memUsed = m.mem_total_mb ? 100 * (1 - m.mem_available_mb / m.mem_total_mb) : 0;
-    const limit = m.max_bots == null ? "" : m.max_bots;
+    const draftKey = "max:" + m.name;
+    const limit = drafts.has(draftKey) ? drafts.get(draftKey) : m.max_bots == null ? "" : m.max_bots;
     return `<div class="machine ${m.paused ? "paused" : ""}">
       <div class="top"><span class="name"><span class="swatch" style="background:${machineColor(m.name)}"></span>${esc(m.name)}</span>
         <span class="badge">${esc(m.platform || "?")}${m.local ? " · coordinator" : ""}${m.paused ? " · paused" : ""}</span></div>
@@ -396,7 +418,8 @@ function renderMachines() {
           ? `<button class="primary" data-cmd='${cmd({action: "resume_machine", machine: m.name})}'>Resume</button>`
           : `<button data-cmd='${cmd({action: "pause_machine", machine: m.name})}'>Pause</button>`}
         <span class="muted">Max bots</span>
-        <input type="number" min="0" max="100" placeholder="∞" value="${limit}" data-max-for="${esc(m.name)}">
+        <input type="number" min="0" max="100" placeholder="∞" value="${esc(String(limit))}" data-max-for="${esc(m.name)}"
+          class="${drafts.has(draftKey) ? "edited" : ""}" title="Type a number, then Set (Esc to undo)">
         <button data-set-max="${esc(m.name)}">Set</button>
       </div>
       <div class="row">
@@ -404,6 +427,8 @@ function renderMachines() {
           data-cmd='${cmd({action: "restart_machine", machine: m.name})}'>${m.local ? "Restart bots" : "Restart agent"}</button>
         <button class="danger" ${m.bots.length ? "" : "disabled"} data-confirm="${esc("Stop all " + m.bots.length + " bots on " + m.name + "?")}"
           data-cmd='${cmd({action: "stop_machine_bots", machine: m.name})}'>Stop its bots</button>
+        <button class="danger" ${m.bots.length ? "" : "disabled"} data-confirm="${esc("Kill all " + m.bots.length + " bots on " + m.name + " right now (browsers force-closed)?")}"
+          data-cmd='${cmd({action: "kill_machine_bots", machine: m.name})}'>Kill its bots</button>
       </div>
     </div>`;
   }).join("");
@@ -411,6 +436,7 @@ function renderMachines() {
 
 /* ---------- Bots + bulk ---------- */
 function renderBots() {
+  if (pointerDown) return;
   const ids = new Set(state.bots.map((b) => b.id));
   [...selected].forEach((id) => { if (!ids.has(id)) selected.delete(id); });
   $("bots").innerHTML = state.bots.map((b) => {
@@ -455,7 +481,9 @@ function renderProxies() {
     <td>${p.benched_until ? `<span class="pill s-connecting">benched ${ago(p.benched_until - now())}</span>` : '<span class="pill s-playing">ok</span>'}</td>
   </tr>`).join("") || '<tr><td colspan="4" class="muted">No proxies.</td></tr>';
   $("bpp").textContent = state.bots_per_proxy + (state.bots_per_proxy === 1 ? " bot" : " bots");
-  if (!editingGroups) $("groups-input").value = state.groups;
+  const gi = $("groups-input");
+  if (document.activeElement !== gi) gi.value = drafts.has("groups") ? drafts.get("groups") : state.groups;
+  gi.classList.toggle("edited", drafts.has("groups"));
 }
 
 function fillSettings(force) {
@@ -628,6 +656,48 @@ async function openShot(botId) {
 }
 function closeShot() { shotBot = null; clearInterval(shotTimer); $("shot-modal").classList.remove("show"); }
 
+/* ---------- Add a machine ---------- */
+function renderAddMachine() {
+  const host = location.hostname, port = state.agent_port;
+  const addr = port && port !== 4041 ? host + ":" + port : host;
+  const repo = "https://github.com/fernand01-hu/powerling-bot.git";
+  const snippet = (text) => `<div class="snippet"><pre class="mono">${esc(text)}</pre><button type="button" data-copy>Copy</button></div>`;
+  let steps;
+  if (!port) {
+    steps = [`This coordinator isn't accepting machines. Restart it with <code>--listen 0.0.0.0</code> first.`];
+  } else if (addOs === "linux") {
+    steps = [
+      "Install the tools and the code:" + snippet(
+        `sudo apt install -y git python3-venv python3-pip\n` +
+        `git clone ${repo} ~/powerline-bot && cd ~/powerline-bot\n` +
+        `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\n` +
+        `.venv/bin/python -m camoufox fetch`),
+      `Set the shared key (the same <code>POWERLINE_AGENT_KEY</code> as on this coordinator) and start the agent:` + snippet(
+        `export POWERLINE_AGENT_KEY='paste-the-shared-key'\n` +
+        `.venv/bin/python agent.py --coordinator ${addr} --headless`),
+    ];
+  } else {
+    steps = [
+      `Install Python from python.org (tick "Add python.exe to PATH") and Git, then in a command prompt:` + snippet(
+        `cd %USERPROFILE%\n` +
+        `git clone ${repo} powerline-bot\n` +
+        `cd powerline-bot\n` +
+        `pip install -r requirements.txt\n` +
+        `python -m camoufox fetch`),
+      `Set the shared key (the same <code>POWERLINE_AGENT_KEY</code> as on this coordinator) and start the agent:` + snippet(
+        `set POWERLINE_AGENT_KEY=paste-the-shared-key\n` +
+        `python agent.py --coordinator ${addr} --headless`),
+    ];
+  }
+  if (port) steps.push(`It appears above within a few seconds. Its code must match this coordinator (version <code>${esc(state.code_version)}</code>); ` +
+    `if the coordinator log says the version differs, copy the coordinator's <code>bot.py</code>, <code>agent.py</code> and <code>humanizer.py</code> to the new machine. ` +
+    `New bots go to it right away; to move running ones, restart them.`);
+  const html = steps.map((t) => `<li>${t}</li>`).join("");
+  const box = $("add-steps");
+  if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
+  document.querySelectorAll("[data-os]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.os === addOs)));
+}
+
 /* ---------- Main refresh ---------- */
 async function refresh() {
   try {
@@ -638,7 +708,7 @@ async function refresh() {
     $("conn").classList.add("ok");
     $("conn-text").textContent = "live · updated " + new Date().toLocaleTimeString();
     renderAlerts(); renderTiles(); renderMachines(); renderBots(); renderProxies(); renderEvents(); renderRotation();
-    fillSettings(false); syncLogFilters();
+    fillSettings(false); syncLogFilters(); renderAddMachine();
   } catch (e) {
     $("conn").classList.remove("ok");
     $("conn-text").textContent = "no data (" + e.message + ")";
@@ -652,6 +722,7 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
   if (btn.dataset.action) {
     if (btn.dataset.action === "stop_all" && !confirm("Stop every bot?")) return;
+    if (btn.dataset.action === "kill_all" && !confirm("Kill every bot right now? Their browsers are force-closed without waiting.")) return;
     command({action: btn.dataset.action}, btn.textContent.trim());
   } else if (btn.dataset.cmd) {
     command(JSON.parse(btn.dataset.cmd), btn.textContent.trim());
@@ -669,16 +740,30 @@ document.addEventListener("click", (e) => {
     const input = document.querySelector(`input[data-max-for="${CSS.escape(btn.dataset.setMax)}"]`);
     const value = input.value === "" ? null : Number(input.value);
     command({action: "set_max_bots", machine: btn.dataset.setMax, max_bots: value}, "Limit set");
+    drafts.delete("max:" + btn.dataset.setMax);
+    input.classList.remove("edited");
   } else if (btn.id === "groups-set") {
     const groups = Number($("groups-input").value);
-    if (groups >= 1 && groups <= 50) command({action: "set_groups", groups}, "Groups set to " + groups);
-    editingGroups = false;
+    if (groups >= 1 && groups <= 50) {
+      command({action: "set_groups", groups}, "Groups set to " + groups);
+      drafts.delete("groups");
+      $("groups-input").classList.remove("edited");
+    } else {
+      toast("Groups must be between 1 and 50");
+    }
   } else if (btn.id === "shot-close") {
     closeShot();
   } else if (btn.id === "shot-again" && shotBot != null) {
     openShot(shotBot);
   } else if (btn.id === "settings-reset" && state) {
     fillSettings(true);
+  } else if (btn.dataset.os) {
+    addOs = btn.dataset.os;
+    if (state) renderAddMachine();
+  } else if (btn.dataset.copy !== undefined) {
+    const text = btn.previousElementSibling.textContent;
+    (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+      .then(() => toast("Copied"), () => toast("Select the text and copy it by hand"));
   }
 });
 document.addEventListener("change", (e) => {
@@ -711,8 +796,29 @@ $("settings-form").addEventListener("submit", async (e) => {
 });
 $("shot-modal").addEventListener("click", (e) => { if (e.target.id === "shot-modal") closeShot(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeShot(); });
-$("groups-input").addEventListener("focus", () => editingGroups = true);
-$("groups-input").addEventListener("blur", () => setTimeout(() => editingGroups = false, 300));
+document.addEventListener("input", (e) => {
+  const t = e.target;
+  if (t.dataset && t.dataset.maxFor !== undefined) { drafts.set("max:" + t.dataset.maxFor, t.value); t.classList.add("edited"); }
+  else if (t.id === "groups-input") { drafts.set("groups", t.value); t.classList.add("edited"); }
+});
+document.addEventListener("keydown", (e) => {
+  const t = e.target;
+  const key = t.dataset && t.dataset.maxFor !== undefined ? "max:" + t.dataset.maxFor : t.id === "groups-input" ? "groups" : null;
+  if (!key) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    (key === "groups" ? $("groups-set") : t.parentElement.querySelector("[data-set-max]")).click();
+  } else if (e.key === "Escape") {
+    drafts.delete(key);
+    t.blur();
+    if (state) { renderMachines(); renderProxies(); }
+  }
+});
+// Hold off redraws while a mouse button is down, so the button being clicked isn't replaced mid-click.
+document.addEventListener("pointerdown", () => pointerDown = true, true);
+const pointerReleased = () => setTimeout(() => { pointerDown = false; }, 0);  // After the click event has fired
+document.addEventListener("pointerup", pointerReleased, true);
+document.addEventListener("pointercancel", pointerReleased, true);
 window.addEventListener("resize", () => { clearTimeout(drawCharts.t); drawCharts.t = setTimeout(drawCharts, 150); });
 
 refresh().then(() => { refreshLogs(); refreshHistory(); });

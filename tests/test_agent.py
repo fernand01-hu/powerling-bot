@@ -81,6 +81,18 @@ class StopTest(unittest.TestCase):
         self.assertFalse(proc.is_alive())
         self.assertEqual(agent.stopping, [])
 
+    def test_force_stop_kills_at_once(self):
+        agent = Agent(name="test", worker_target=fake_stubborn_worker)
+        agent.start_bot(0, "room", proxy("a"), "Nick", 0)
+        time.sleep(0.5)
+        proc = agent.workers[0][0]
+        started = time.time()
+        agent.handle({"type": "stop", "bots": [0], "force": True})
+        self.assertLess(time.time() - started, 3.0)  # No 8s grace period
+        self.assertFalse(proc.is_alive())
+        self.assertEqual(agent.stopping, [])
+        self.assertEqual(agent.health()["bots"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

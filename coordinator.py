@@ -393,8 +393,8 @@ class RemoteAgent:
     def update_proxy(self, bot_id: int, proxy: Dict[str, str]):
         self.send({"type": "update_proxy", "bot": bot_id, "proxy": proxy})
 
-    def stop_bots(self, bot_ids: List[int]):
-        self.send({"type": "stop", "bots": bot_ids})
+    def stop_bots(self, bot_ids: List[int], force: bool = False):
+        self.send({"type": "stop", "bots": bot_ids, "force": force})
 
     def stop_all(self):
         self.send({"type": "stop_all"})
@@ -556,6 +556,7 @@ class Coordinator:
         # No authkey on the listener itself: each connection proves the key in its own thread,
         # so one that connects and never answers can't stop other agents from joining.
         listener = multiprocessing.connection.Listener(address)
+        self.agent_port = address[1]
         logger.info(f"[Coordinator] Waiting for agents on {address[0]}:{address[1]} (code version {code_version()})")
 
         def handshake(conn: multiprocessing.connection.Connection):
@@ -919,8 +920,8 @@ class Coordinator:
     def agent_by_name(self, name: str):
         return next((a for a in self.agents if a.name == name), None)
 
-    def unplace(self, bot_ids: List[int]):
-        """Stop bots wherever they run (they are not restarted by this)."""
+    def unplace(self, bot_ids: List[int], force: bool = False):
+        """Stop bots wherever they run (they are not restarted by this). force=True kills them at once."""
         by_agent: Dict[int, Tuple[object, List[int]]] = {}
         for bot_id in bot_ids:
             agent = self.bot_agent.pop(bot_id, None)
@@ -929,7 +930,10 @@ class Coordinator:
             if agent is not None:
                 by_agent.setdefault(id(agent), (agent, []))[1].append(bot_id)
         for agent, ids in by_agent.values():
-            agent.stop_bots(ids)
+            if force:
+                agent.stop_bots(ids, force=True)
+            else:
+                agent.stop_bots(ids)
 
     def set_groups(self, groups: int):
         if groups < 1 or groups == self.groups:
@@ -960,8 +964,8 @@ class Coordinator:
         ids = value if isinstance(value, list) else [value]
         return sorted({b for b in ids[:500] if isinstance(b, int) and not isinstance(b, bool) and 0 <= b < self.total})
 
-    def stop_bot_ids(self, bot_ids: List[int]):
-        self.unplace(bot_ids)
+    def stop_bot_ids(self, bot_ids: List[int], force: bool = False):
+        self.unplace(bot_ids, force=force)
         self.stopped.update(bot_ids)
 
     def start_bot_ids(self, bot_ids: List[int]):
@@ -1023,12 +1027,15 @@ class Coordinator:
             if agent is None:
                 raise ValueError(f"bot #{bots[0]} isn't running")
             agent.request_screenshot(bots[0])
-        elif action in ("restart_machine", "stop_machine_bots") and self.agent_by_name(cmd.get("machine", "")):
+        elif action in ("restart_machine", "stop_machine_bots", "kill_machine_bots") and self.agent_by_name(cmd.get("machine", "")):
             agent = self.agent_by_name(cmd["machine"])
             its_bots = sorted(b for b, a in self.bot_agent.items() if a is agent)
             if action == "stop_machine_bots":
                 logger.info(f"[Coordinator] Dashboard: stopping the bots on {agent.name} {its_bots}.")
                 self.stop_bot_ids(its_bots)
+            elif action == "kill_machine_bots":
+                logger.info(f"[Coordinator] Dashboard: killing the bots on {agent.name} {its_bots}.")
+                self.stop_bot_ids(its_bots, force=True)
             elif isinstance(agent, RemoteAgent):
                 logger.info(f"[Coordinator] Dashboard: restarting the agent on {agent.name}; its bots move meanwhile.")
                 agent.restart()  # It disconnects; its bots are re-placed and it rejoins after restarting
@@ -1037,10 +1044,9 @@ class Coordinator:
                 self.start_bot_ids(its_bots)
         elif action == "set_settings":
             self.apply_settings(cmd)
-        elif action == "stop_all":
-            logger.info("[Coordinator] Dashboard: stopping all bots.")
-            self.unplace(list(range(self.total)))
-            self.stopped.update(range(self.total))
+        elif action in ("stop_all", "kill_all"):
+            logger.info(f"[Coordinator] Dashboard: {'killing' if action == 'kill_all' else 'stopping'} all bots.")
+            self.stop_bot_ids(list(range(self.total)), force=action == "kill_all")
         elif action == "start_all":
             logger.info("[Coordinator] Dashboard: starting all stopped bots.")
             for i, b in enumerate(sorted(self.stopped)):
@@ -1149,6 +1155,7 @@ class Coordinator:
             "time": now,
             "room": self.args.room,
             "code_version": code_version(),
+            "agent_port": getattr(self, "agent_port", None),
             "groups": self.groups,
             "bots_per_proxy": bpp,
             "machines": machines,
