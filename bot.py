@@ -388,7 +388,7 @@ class PowerlineBot:
         h = humanizer or self.humanizer or Humanizer(page=page)
         # Matched by button text so it keeps working if the CMP's markup changes; the banner
         # can be in the page itself or inside a CMP iframe, so check every frame.
-        for frame in page.frames:
+        for frame in getattr(page, "frames", []):
             try:
                 decline_btn = frame.get_by_role("button", name=CONSENT_DECLINE_PATTERN)
                 if decline_btn.count() > 0 and decline_btn.first.is_visible():
@@ -526,6 +526,8 @@ class PowerlineBot:
                     f"{self.log_prefix} Game server connection blocked ({self.ws_blocked_reason}); aborting lobby wait."
                 )
                 break
+            self.dismiss_overlays_and_consent(page, humanizer=self.humanizer)
+            EzSolver.solve(page, log_prefix=self.log_prefix, timeout=2.0, humanizer=self.humanizer)
             try:
                 page.wait_for_selector("#nick", state="visible", timeout=1000)
                 break
