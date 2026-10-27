@@ -1,125 +1,401 @@
-# Powerline.io Multi-Instance Bot
+# Powerline.io Multi-Machine Bot
 
-Runs several Camoufox (anti-detect Firefox) browser instances that join a powerline.io room and play continuously, using Webshare proxies.
+Runs many Camoufox (anti-detect Firefox) browsers that join a powerline.io room and play continuously. The bots can be spread over any number of Linux and Windows machines on the same network, all controlled from one place with a web dashboard.
 
-**Full guide (setup, dashboard, troubleshooting): [GUIDE.md](GUIDE.md)**
+- [How it works](#how-it-works)
+- [Setup on any machine](#setup-on-any-machine)
+- [Connecting the machines](#connecting-the-machines)
+- [Running it](#running-it)
+- [Dashboard](#dashboard)
+- [Start automatically at boot](#start-automatically-at-boot)
+- [Updating the code](#updating-the-code)
+- [All options](#all-options)
+- [Troubleshooting](#troubleshooting)
+- [Tests](#tests)
+
+More depth (internals, failure handling, capacity numbers, message reference): [GUIDE.md](GUIDE.md).
+
+---
 
 ## How it works
 
-1. **Coordinator** (`coordinator.py`): splits the bots into `--groups` groups of `--bots-per-proxy` bots, each group on its own proxy IP, and gives every bot one random nickname for the whole run. It places each bot on an agent (the one running the fewest bots per CPU core) and restarts bots whose worker exits, with the same name, on their group's current proxy. All browsers stay open until you stop it. Every `--proxy-check-interval` seconds it re-reads the proxy list (all pages) from Webshare: a group keeps its proxy while it's still listed, and when Webshare rotates it out the group moves to an unused proxy and its bots are told to switch. A proxy that can't reach the game (the browser can't launch through it, or the page stays on "Connecting..." through two reloads) is benched for 30 minutes and its group is moved the same way.
-2. **Agent** (`agent.py`): starts and stops bot workers on its machine when the coordinator says so, passes them proxy changes, and reports workers that exit plus CPU/RAM health. For now the coordinator runs one agent on the same machine; agents on other machines are the next step.
-3. **Workers** (`bot.py`, `bot_worker_process`): each gets an isolated `HOME` (a fresh `/tmp/camoufox_worker_N_*` folder, deleted when the worker exits), waits a staggered start delay, and launches Camoufox through its group's proxy (`--bots-per-proxy` workers share one proxy).
-4. **Session** (`PowerlineBot.run_session`): dismisses consent/reconnect dialogs, handles the Turnstile check, types its nickname the first time it joins, and steers with arrow keys (biased Down/Left, never reversing 180°) while the game's menu overlay is hidden (i.e. actually playing), until the death or lobby screen reappears. It respawns (with Enter) after a random delay that is usually under 2s and occasionally up to 15s; since the game ignores input for about 2s after a death, most respawns land at about 2.5s. When the coordinator reports a new proxy IP, it reloads the game on that IP without closing the browser (in a fresh context, since a context's proxy is fixed). If it stays stuck out of the game for 30s it also reloads the page.
-5. **Input** (`humanizer.py`): every click, mouse move, keypress and pause goes through a `Humanizer` (curved mouse paths, randomized key and click timing, typing with occasional corrected typos). Camoufox's built-in `humanize` is turned off so input isn't humanized twice.
+There are three kinds of process, and only one of them is special:
 
-## Requirements
+| Process | File | Runs on | Job |
+| --- | --- | --- | --- |
+| **Coordinator** | `coordinator.py` | exactly **one** machine | The brain. Decides how many bots exist, which proxy each group uses, and which machine runs each bot. Serves the dashboard. Talks to Webshare. |
+| **Agent** | `agent.py` | **every** machine that runs bots (the coordinator starts its own built-in agent too) | The hands. Starts and stops bot workers on its machine when told to, and reports their status and the machine's CPU/RAM every 5 s. |
+| **Worker** | `bot.py` | started by an agent, one per bot | One browser playing one bot: loads the room, passes the Turnstile check, types its nickname, steers, respawns. Input goes through `humanizer.py`. |
 
-- Linux with a display, or Windows 10/11 (either one can use `--headless`)
-- Python 3.10+ (tested on 3.10 and 3.14)
-- `pip install -r requirements.txt && python3 -m camoufox fetch`
+```mermaid
+flowchart TB
+    you["You (any browser on the network)"]
+    ws[("Webshare API<br/>proxy list")]
+    game[("powerline.io")]
 
-## Usage
+    subgraph C["Coordinator machine"]
+        coord["coordinator.py<br/>placement · proxies · restarts"]
+        dash["Dashboard :4042"]
+        la["built-in agent"]
+        w0["worker<br/>Camoufox"]
+        coord --- dash
+        coord --- la --> w0
+    end
 
-```bash
-export WEBSHARE_API_KEY=your_key_here
-python3 coordinator.py                       # 3 groups x 3 bots, room 2cjg
-python3 coordinator.py --groups 4 --bots-per-proxy 2 --headless
+    subgraph A["Machine 2 (Linux)"]
+        a1["agent.py"] --> w1["worker"] & w2["worker"]
+    end
+
+    subgraph B["Machine 3 (Windows)"]
+        a2["agent.py"] --> w3["worker"] & w4["worker"]
+    end
+
+    you -- "HTTP + password" --> dash
+    coord -- "HTTPS, API key" --> ws
+    a1 -- "TCP :4041<br/>shared key" --> coord
+    a2 -- "TCP :4041<br/>shared key" --> coord
+    w0 & w1 & w2 & w3 & w4 -. "through a proxy" .-> game
 ```
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `--room` | `2cjg` | Room code (the part after `#` in the URL) |
-| `--webshare-key` | `$WEBSHARE_API_KEY` | Webshare API key (required) |
-| `--groups` | `3` | Number of groups, each on its own proxy IP |
-| `--bots-per-proxy` | `3` | Bots in each group |
-| `--stagger-interval` | `3.0` | Seconds between bots in a group connecting |
-| `--proxy-check-interval` | `60` | Seconds between Webshare checks for rotated proxy IPs |
-| `--headless` | off | Run browsers headless |
-| `--debug-dir` | off | Save screenshots of key moments (load, spawn, death, every 30s in game) to this folder |
+Key ideas:
 
-`python3 bot.py` with the same options still works and does the same thing.
+- **Groups.** Bots are split into `--groups` groups of `--bots-per-proxy` bots. Every bot in a group uses the same proxy IP. Each bot keeps one random nickname for the whole run, even across restarts.
+- **Placement.** A new bot goes to the machine with the fewest bots per CPU thread that is not paused and not at its bot limit. A machine that stays above 85% CPU for 30 s hands one bot (same name, same proxy) to a machine below 65%, at most one move per minute.
+- **Self-healing.** A worker that exits is restarted with the same name, waiting longer after each failure (up to 60 s). If a machine disconnects, its bots are restarted on the others. If the coordinator disappears, every agent stops its bots and keeps trying to reconnect every 5 s.
+- **Proxies.** Only the coordinator knows the Webshare key. It re-reads the proxy list every `--proxy-check-interval` seconds; when Webshare rotates a group's IP away, the group moves to an unused IP and its bots reload on it without closing the browser. A proxy that can't reach the game is benched for 30 minutes.
+- **Agents connect out to the coordinator**, never the other way round, so only the coordinator machine needs an open port.
 
-Stop with `Ctrl+C`: the coordinator tells every agent to stop its workers, each worker closes its browser, and anything left in a worker's process group is killed (other Camoufox processes on the machine are not touched). On Windows, Ctrl+Break works the same way. If the coordinator itself crashes or is killed, its workers and their browsers shut down on their own.
+### What happens when a machine joins
 
-## Several machines
-
-The coordinator can spread the bots over several machines on the same network. Each machine runs an agent that connects to the coordinator; new bots go to the machine with the fewest bots per CPU thread, a machine that stays above 85% CPU for 30s hands one bot (same name and proxy) to a machine below 65%, and the bots of a machine that disconnects are restarted elsewhere. Only the coordinator needs the Webshare key.
-
-All machines need the same code (agents with different code are refused) and a shared secret:
-
-```bash
-export POWERLINE_AGENT_KEY=some-long-random-secret   # same value on every machine
-
-# Coordinator (here: also runs at most 1 bot itself)
-python3 coordinator.py --listen 0.0.0.0 --local-max-bots 1 --headless
-
-# Every other machine (Windows: `set POWERLINE_AGENT_KEY=...` and `python agent.py ...`)
-python3 agent.py --coordinator 192.168.1.96 --headless
+```mermaid
+sequenceDiagram
+    participant A as agent.py (new machine)
+    participant C as coordinator.py
+    A->>C: TCP connect to :4041
+    C->>A: random challenge
+    A->>C: HMAC(challenge, POWERLINE_AGENT_KEY)
+    A->>C: random challenge
+    C->>A: HMAC(challenge, POWERLINE_AGENT_KEY)
+    Note over A,C: both sides prove they know the key;<br/>wrong key → disconnect (the key never crosses the network)
+    A->>C: hello: code version, CPU threads, RAM
+    Note over C: different code version → refused<br/>with "update its files"
+    C-->>A: accepted
+    loop every 5 s
+        A->>C: health: CPU, RAM, state of each bot
+    end
+    C->>A: start bot #4 "Viper", group 1, proxy X
+    A->>A: launch worker (isolated temp HOME)
+    C->>A: proxy for group 1 changed → Y
+    Note over A: worker reloads the game on Y
+    Note over C: no message for 30 s →<br/>machine is gone, its bots move elsewhere
 ```
 
-| Coordinator option | Default | Description |
-| --- | --- | --- |
-| `--listen` | off | Accept agents on `HOST[:PORT]` (default port 4041) |
-| `--wait-agents` | `15` | Seconds to let agents connect before placing bots |
-| `--local-max-bots` | no limit | Most bots this machine runs itself |
-| `--no-local-agent` | off | Run no bots on the coordinator machine |
+All messages are length-prefixed JSON (never pickle), with a size limit.
 
-| Agent option | Default | Description |
-| --- | --- | --- |
-| `--coordinator` | required | Coordinator address `HOST[:PORT]` |
-| `--max-bots` | no limit | Most bots this machine runs |
-| `--headless` | off | Run browsers headless |
-| `--name` | hostname | Name shown in the coordinator's log |
-| `--debug-dir` | off | Save screenshots of key moments |
+### A bot's life
 
-If the connection drops, an agent stops its bots and reconnects every 5s, so either side can be restarted at any time. Bot names, paused machines, machine bot limits and stopped bots are saved to `~/.config/powerline-bot/state.json` on the coordinator (`--state-file` to change it), so they survive restarts. Coordinator and agents exchange plain JSON messages (never pickle) after both prove they know the shared key. A bot that keeps failing waits longer before each restart (up to 60s), and proxy failures make the coordinator re-read Webshare's list right away, since they usually mean Webshare just rotated its IPs.
+```mermaid
+stateDiagram-v2
+    [*] --> starting: agent launches worker
+    starting --> loading: staggered wait, then browser opens
+    loading --> connecting: page loaded, Turnstile passed
+    connecting --> lobby: game server reached
+    connecting --> loading: still "Connecting..." after 30 s (reload, twice)
+    connecting --> [*]: still stuck → proxy benched, group moves
+    lobby --> playing: nickname typed, Enter
+    playing --> dead: hit a trail
+    dead --> playing: respawn (usually about 2.5 s)
+    playing --> loading: coordinator sends a new proxy IP
+```
+
+---
+
+## Setup on any machine
+
+Do this on **every** machine, coordinator included. Any machine can be the coordinator: pick one that stays on (it does little work itself; 4 threads is plenty).
+
+### Requirements
+
+- Linux (tested on Ubuntu 22.04) or Windows 10/11
+- Python 3.10 or newer (tested on 3.10 and 3.14)
+- About 3 GB of disk for the browser, and roughly 0.5 CPU thread + 400 MB RAM per bot (headless)
+- All machines on the same local network
+
+### Linux
+
+```bash
+sudo apt install -y python3 python3-pip git
+git clone https://github.com/fernand01-hu/powerling-bot.git ~/powerline-bot
+cd ~/powerline-bot
+pip install -r requirements.txt
+python3 -m camoufox fetch          # downloads the browser (~2.4 GB unpacked)
+python3 -m unittest discover -s tests   # optional: should print OK
+```
+
+On a laptop, turn off automatic suspend, or its bots stop whenever it sleeps:
+
+```bash
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
+### Windows
+
+1. Install Python from python.org and tick **"Add python.exe to PATH"**.
+2. Install Git for Windows (or download the repository as a ZIP and unpack it to `C:\Users\<you>\powerline-bot`).
+3. In a command prompt:
+
+```bat
+cd %USERPROFILE%
+git clone https://github.com/fernand01-hu/powerling-bot.git powerline-bot
+cd powerline-bot
+pip install -r requirements.txt
+python -m camoufox fetch
+```
+
+4. In *Settings → System → Power*, set sleep to **Never**.
+
+> **Always run `camoufox fetch` before starting bots.** If the browser is missing, every worker tries to download it into the same folder at the same moment and the install ends up broken ("Camoufox is not installed at …"). Fix: delete the folder named in the error (under `~/.cache/camoufox/browsers/` on Linux) and run `camoufox fetch` again.
+
+---
+
+## Connecting the machines
+
+### 1. Choose a shared key
+
+All machines prove they belong together with one secret. Generate it once:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+and set it as `POWERLINE_AGENT_KEY` on **every** machine (same value everywhere). Treat it like a password: never commit it.
+
+### 2. Find the coordinator's address
+
+On the coordinator machine run `hostname -I` (Linux) or `ipconfig` (Windows) and note its local IP, e.g. `192.168.1.96`. Give it a fixed address (DHCP reservation in your router) so the agents can always find it. Below it is called `COORD_IP`.
+
+### 3. Open the ports on the coordinator only
+
+| Port | Used by | Who connects |
+| --- | --- | --- |
+| 4041 | agents | the other machines |
+| 4042 | dashboard | your browser |
+
+Linux with ufw (allows only your local network):
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 4041,4042 proto tcp
+```
+
+Windows coordinator: allow inbound TCP 4041 and 4042 for Python in *Windows Defender Firewall → Advanced settings → Inbound rules*.
+
+Agent machines need **no** open ports, they only connect out. **Never forward 4041 or 4042 on your router**: they are meant for your local network only.
+
+### 4. Check that an agent can reach the coordinator
+
+```bash
+nc -zv COORD_IP 4041                                   # Linux
+powershell Test-NetConnection COORD_IP -Port 4041      # Windows
+```
+
+(Run this once the coordinator is started.)
+
+### 5. Same code everywhere
+
+The coordinator compares a fingerprint of `bot.py`, `agent.py` and `humanizer.py` with each agent's and refuses agents whose code differs. Keep every machine on the same commit (`git pull` everywhere, see [Updating the code](#updating-the-code)). The coordinator logs its version at start: `Waiting for agents on 0.0.0.0:4041 (code version 1a2b3c4d5e6f)`.
+
+---
+
+## Running it
+
+### Coordinator machine
+
+```bash
+cd ~/powerline-bot
+export POWERLINE_AGENT_KEY='the-shared-key'
+export WEBSHARE_API_KEY='your-webshare-api-key'
+export POWERLINE_DASHBOARD_PASSWORD='a-dashboard-password'
+
+python3 coordinator.py --listen 0.0.0.0 --dashboard 0.0.0.0 --headless \
+    --groups 5 --bots-per-proxy 3 --local-max-bots 1 --wait-agents 40
+```
+
+This waits 40 s for agents to join, then places 5 × 3 = 15 bots, running at most 1 on the coordinator itself (`--no-local-agent` runs none there).
+
+### Every other machine
+
+Linux:
+
+```bash
+cd ~/powerline-bot
+export POWERLINE_AGENT_KEY='the-shared-key'
+python3 agent.py --coordinator COORD_IP --headless --max-bots 8
+```
+
+Windows:
+
+```bat
+cd %USERPROFILE%\powerline-bot
+set POWERLINE_AGENT_KEY=the-shared-key
+python agent.py --coordinator COORD_IP --headless --max-bots 8
+```
+
+The order doesn't matter: agents started first keep retrying every 5 s, and an agent that joins later gets new bots (bots already running stay where they are until restarted or moved for overload).
+
+On a successful join the coordinator logs `Agent <hostname> joined (N CPU threads, ... MB free)` and the machine shows up on the dashboard.
+
+### Single machine
+
+Everything also works on one machine with no networking:
+
+```bash
+export WEBSHARE_API_KEY='your-webshare-api-key'
+python3 coordinator.py --groups 3 --bots-per-proxy 3 --headless
+```
+
+### Stopping
+
+`Ctrl+C` on the coordinator (Ctrl+Break on Windows) tells every agent to stop its workers and close their browsers. Stopping an agent stops only that machine's bots; the coordinator restarts them elsewhere. If the coordinator is killed, agents stop their bots on their own.
+
+---
 
 ## Dashboard
 
-The coordinator can serve a password-protected web page for running everything:
+Open `http://COORD_IP:4042` and log in with any user name and `POWERLINE_DASHBOARD_PASSWORD`.
 
-- **Overview**: every bot (state: loading / connecting / lobby / playing / dead, machine, group, IP, rounds, last respawn time), every machine (CPU, RAM, bots), the proxies and a countdown to Webshare's next IP rotation.
-- **Alerts**: a banner when a machine disconnects or is overloaded, bots wait for room or keep failing, every proxy is benched, or Webshare stops answering.
-- **Bots**: stop, start or restart one bot, a selection (checkboxes) or all of them; 📷 shows what a bot's browser currently displays.
-- **Machines**: pause/resume (its bots move elsewhere), bot limit, restart its agent (also loads updated code), stop its bots.
-- **Last hour**: CPU and RAM per machine and bots running/playing, as charts (hover for values).
-- **Live logs** from every machine and bot, filterable by machine, bot and level, plus the coordinator's own events.
-- **Settings**: room code, bots per group, proxy check interval and join stagger; saved and kept after a restart (changing the room or bots per group restarts the bots). Groups can be changed under Proxies.
+- **Overview**: every bot (loading / connecting / lobby / playing / dead, machine, group, IP, rounds, last respawn), every machine (CPU, RAM, bots), the proxies and a countdown to the next Webshare rotation.
+- **Alerts**: a machine disconnected or overloaded, bots waiting for room or failing repeatedly, all proxies benched, Webshare not answering.
+- **Bots**: stop, start or restart one bot, a selection or all of them; 📷 shows what a bot's browser is displaying.
+- **Machines**: pause/resume (its bots move elsewhere), set a bot limit, restart its agent (also loads updated code), stop its bots.
+- **Last hour**: CPU and RAM per machine and bots running/playing.
+- **Live logs** from every machine and bot, filterable by machine, bot and level.
+- **Settings**: room code, bots per group, groups, proxy check interval, join stagger. Saved to the state file and kept after restarts.
 
-```bash
-export POWERLINE_DASHBOARD_PASSWORD=choose-a-password
-python3 coordinator.py --listen 0.0.0.0 --dashboard 0.0.0.0 --headless   # then open http://<coordinator>:4042
+Saved settings (including per-machine bot limits set on the dashboard) override the command line. Bot names, paused machines and stopped bots are kept in `~/.config/powerline-bot/state.json` on the coordinator.
+
+---
+
+## Start automatically at boot
+
+`deploy/` has ready-made files. Combine with `--start-stopped` if you'd rather press **Start all** on the dashboard yourself after a reboot.
+
+**Secrets file** (every Linux machine), `~/.config/powerline-bot/env`, `chmod 600`. Start from `deploy/env.example`:
+
+```ini
+POWERLINE_AGENT_KEY=the-shared-key
+# coordinator machine only:
+WEBSHARE_API_KEY=your-webshare-api-key
+POWERLINE_DASHBOARD_PASSWORD=a-dashboard-password
+COORDINATOR_ARGS=--listen 0.0.0.0 --dashboard 0.0.0.0 --headless --local-max-bots 1 --groups 5 --bots-per-proxy 3 --wait-agents 40
+# agent machines only:
+AGENT_ARGS=--coordinator COORD_IP --headless
 ```
 
-Log in with any user name and that password. Keep port 4042 inside your network (don't forward it on the router).
-
-## Start automatically
-
-`deploy/` has everything to start the system when the machines boot. With `--start-stopped` the coordinator, dashboard and agents come up but every bot waits until you press **Start all** (or start single bots) on the dashboard.
-
-**Coordinator machine** (Linux, systemd user service):
+**Coordinator (Linux, systemd user service):**
 
 ```bash
 mkdir -p ~/.config/powerline-bot ~/.config/systemd/user
 cp deploy/env.example ~/.config/powerline-bot/env && chmod 600 ~/.config/powerline-bot/env
-nano ~/.config/powerline-bot/env          # fill in the keys and password, keep COORDINATOR_ARGS
+nano ~/.config/powerline-bot/env
 cp deploy/powerline-coordinator.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now powerline-coordinator
-loginctl enable-linger                     # run at boot without anyone logged in
-journalctl --user -u powerline-coordinator -f   # follow its log
+loginctl enable-linger                          # start at boot without anyone logged in
+journalctl --user -u powerline-coordinator -f   # follow the log
 ```
 
-**Other Linux machines**: the same with `deploy/powerline-agent.service` (`systemctl --user enable --now powerline-agent`); their env file only needs `POWERLINE_AGENT_KEY` and `AGENT_ARGS`.
+**Linux agents:** the same with `deploy/powerline-agent.service` (`systemctl --user enable --now powerline-agent`).
 
-**Windows**: copy `deploy/start-agent.cmd` next to `agent.py`, then in a command prompt:
+**Windows agents:** edit the coordinator address in `deploy/start-agent.cmd`, copy it next to `agent.py`, then:
 
 ```bat
-setx POWERLINE_AGENT_KEY "same-secret-as-the-coordinator"
+setx POWERLINE_AGENT_KEY "the-shared-key"
 schtasks /Create /TN "Powerline agent" /SC ONLOGON /RL LIMITED /F /TR "\"%USERPROFILE%\powerline-bot\start-agent.cmd\""
 schtasks /Run /TN "Powerline agent"
 ```
 
-It starts when you log in and restarts the agent if it ever exits (log: `agent.log`).
+It starts when you log in, restarts the agent whenever it exits (so **Restart agent** on the dashboard works), and logs to `agent.log`.
+
+---
+
+## Updating the code
+
+```mermaid
+flowchart LR
+    p["git pull<br/>on every machine"] --> r1["restart the coordinator"]
+    r1 --> r2["dashboard → Machines →<br/>Restart agent on each"]
+    r2 --> ok["all versions match,<br/>bots placed again"]
+```
+
+1. `git pull` in `powerline-bot` on every machine (or copy the same files over).
+2. Restart the coordinator (`systemctl --user restart powerline-coordinator`, or Ctrl+C and start it again).
+3. Restart each agent: **Restart agent** on the dashboard if it runs under systemd or `start-agent.cmd`, otherwise stop and start it by hand.
+
+An agent still on old code shows `code version ... differs from the coordinator's ...; update its files` in the coordinator log and keeps retrying until it is updated.
+
+---
+
+## All options
+
+### `coordinator.py`
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--room` | `2cjg` | Room code (the part after `#` in the URL) |
+| `--webshare-key` | `$WEBSHARE_API_KEY` | Webshare API key (required unless `--direct`) |
+| `--groups` | `3` | Number of groups, each on its own proxy IP |
+| `--bots-per-proxy` | `3` | Bots in each group |
+| `--stagger-interval` | `3.0` | Average seconds between bots of a group connecting |
+| `--proxy-check-interval` | `60` | Seconds between Webshare proxy-list checks |
+| `--headless` | off | Run browsers headless (the coordinator's own bots) |
+| `--debug-dir` | off | Save screenshots of key moments to this folder |
+| `--listen` | off | Accept agents on `HOST[:PORT]` (port 4041; needs `$POWERLINE_AGENT_KEY`) |
+| `--wait-agents` | `15` | Seconds to let agents connect before placing bots |
+| `--dashboard` | off | Serve the dashboard on `HOST[:PORT]` (port 4042; needs `$POWERLINE_DASHBOARD_PASSWORD`) |
+| `--local-max-bots` | no limit | Most bots the coordinator machine runs itself |
+| `--no-local-agent` | off | Run no bots on the coordinator machine (needs `--listen`) |
+| `--state-file` | `~/.config/powerline-bot/state.json` | Where names and dashboard settings are kept |
+| `--start-stopped` | off | Start with every bot stopped, to be started from the dashboard |
+| `--direct` | off | No proxies: bots use the machine's own connection |
+| `--no-auto-replace` | off | Don't ask Webshare to replace a proxy that is reported bad |
+| `--clean-proxies` | off | Check all proxies at start and replace flagged ones through Webshare |
+
+### `agent.py`
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--coordinator` | required | Coordinator address `HOST[:PORT]` (port 4041) |
+| `--max-bots` | no limit | Most bots this machine runs |
+| `--headless` | off | Run browsers headless |
+| `--name` | hostname | Name shown on the dashboard (must be unique per machine) |
+| `--debug-dir` | off | Save screenshots of key moments |
+
+### Environment variables
+
+| Variable | Where | Purpose |
+| --- | --- | --- |
+| `POWERLINE_AGENT_KEY` | every machine | Shared secret for the coordinator ↔ agent link |
+| `WEBSHARE_API_KEY` | coordinator | Webshare API access |
+| `POWERLINE_DASHBOARD_PASSWORD` | coordinator | Dashboard login |
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Agent: `not reachable ([Errno 111] Connection refused)` | Coordinator not running, or not started with `--listen` | Start it with `--listen 0.0.0.0` |
+| Agent: connection times out | Firewall on the coordinator | Open port 4041 (see [step 3](#3-open-the-ports-on-the-coordinator-only)) |
+| Coordinator: `Refused a connection` / agent disconnected right away | `POWERLINE_AGENT_KEY` differs | Set the same value everywhere (watch for stray spaces or quotes on Windows `set`) |
+| Coordinator: `code version ... differs` | Machines on different code | `git pull` everywhere and restart |
+| Two machines keep replacing each other on the dashboard | Same hostname (a new link with the same name replaces the old one) | Start one with `--name other-name` |
+| `Camoufox is not installed at ...` | Browser missing or broken download | Delete that folder, run `python3 -m camoufox fetch` |
+| Bots stay on "connecting", then the group moves | That proxy IP can't reach the game server | Handled automatically (benched 30 min); check Webshare if it happens to every group |
+| `407 Proxy Authentication Required` | Webshare rejected the proxy login, usually an IP that just rotated | The next proxy-list check moves the group |
+| A machine's bots all restart at once | It slept or lost the network | Disable sleep; check its cable/Wi-Fi |
+| Server shows a lower bot limit than `--local-max-bots` | A limit saved from the dashboard wins | Change it on the dashboard |
+| Dashboard says 401 | Wrong password | Check `POWERLINE_DASHBOARD_PASSWORD` on the coordinator |
+
+---
 
 ## Tests
 
@@ -127,10 +403,10 @@ It starts when you log in and restarts the agent if it ever exits (log: `agent.l
 python3 -m unittest discover -s tests
 ```
 
-222 tests (about 18s) that need no browser, no Webshare account and no internet: fake pages, browsers, agents and Webshare responses stand in for the real ones (`tests/fakes.py`). They cover:
+222 tests (about 18 s) that need no browser, no Webshare account and no internet: fakes in `tests/fakes.py` stand in for pages, browsers, agents and Webshare. They cover the humanizer, bot logic, coordinator placement and proxy handling, the agent link and message format, and the dashboard.
 
-- **humanizer**: timing distributions, mouse paths (always end on target, no jumps, overshoot rules), click spots inside buttons, typing (typos always corrected), idle drift, fatigue, watchdog
-- **bot**: names, steering odds, status reports and throttling, proxy updates and the stop message, page loading, proxy switching, the respawn loop, exit codes, process-tree clean-up
-- **coordinator**: Webshare paging and errors, rotation countdown, randomized checks of proxy assignment and machine placement, restart backoff, bad-proxy benching, machines leaving, overload moves, snapshot states, state file
-- **agent and network**: message format (JSON only, size limit), every command, the serve loop, reconnects, wrong keys, stalled connections, pickle rejection
-- **dashboard**: login, every bad request, security headers, every button maps to an accepted action, every command
+## Security notes
+
+- Never commit `WEBSHARE_API_KEY`, `POWERLINE_AGENT_KEY` or the dashboard password; keep them in the environment or in `~/.config/powerline-bot/env` (`chmod 600`).
+- Keep ports 4041 and 4042 inside your local network.
+- The agent link authenticates with a challenge–response on the shared key and only accepts JSON, so a stranger on the network can't control your machines without the key.
