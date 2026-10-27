@@ -1,139 +1,136 @@
 # Powerline.io Multi-Instance Bot
 
-A humanized, multi-instance browser bot for [powerline.io](https://powerline.io/) built with Python and Selenium Chrome WebDriver. It supports Webshare HTTP proxies, automatic IP rotation, ultra-low proxy bandwidth consumption (~100–130 KB per bot session), server/region selection, immediate auto-respawn on death, and background/minimized window execution without stealing window focus.
+Runs several Camoufox (anti-detect Firefox) browser instances that join a powerline.io room and play continuously, using Webshare proxies.
 
----
+**Full guide (setup, dashboard, troubleshooting): [GUIDE.md](GUIDE.md)**
 
-## Features
+## How it works
 
-- **Multi-Instance Execution**: Launch multiple bots concurrently (default: `4` instances) in separate threads.
-- **Pre-Flight Proxy Health Check & Filtering**:
-  - Automatically verifies all proxies in parallel against the target game server's WebSocket endpoint in ~1.5 seconds on startup.
-  - Skips any proxy IPs rejected with `400 Bad Request` or connect errors by the game server, ensuring only 100% verified working IPs are assigned.
-  - Automatically calculates capacity and adjusts `--bots-per-ip` if necessary so all requested bot instances run reliably.
-- **Proxy Pool & Automatic IP Rotation**:
-  - Reads `host:port:username:password` proxies from a text file (default: `Webshare 10 proxies(4).txt`).
-  - Distributes bots evenly across active verified proxies.
-  - Rotates each bot to a fresh proxy IP every **5 minutes** (`--ip-rotate-seconds 300` with ±8% human jitter) without restarting Chrome.
-  - Automatically detects and skips proxy IPs that trigger a persistent Cloudflare Turnstile challenge.
-- **~98% Proxy Bandwidth Reduction (~100–150 KB per bot)**:
-  - Pre-seeds a local static asset cache (`/tmp/powerline_http_cache_seed`) once and copies it into each bot's isolated `--disk-cache-dir` so the 2.5 MB game bundle (`index.x_1H9pPP.mjs`), CSS, fonts, and sprites cost **0 bytes** of proxy traffic.
-  - Blocks all ad networks, analytics, trackers, audio files (`*.ogg`, `*.mp3`), and Chrome background updater traffic (`*.gvt1.com`, `*.googleapis.com`) at both the socket and CDP levels.
-- **100% Isolated Cookies & Storage**:
-  - Each bot runs in its own temporary `--user-data-dir` profile and clears cookies/`localStorage`/`sessionStorage` whenever its IP rotates.
-- **Ultra-Low Graphics & Resolution**:
-  - Automatically zooms Chrome in to **500%** (`Ctrl` + `+` / `setDefaultZoom(5.0)`) and toggles **Low Graphics** (`G` key, `highQuality = false`), shrinking the WebGL canvas for minimal CPU/GPU usage.
-- **Human-Like Input & Stealth**:
-  - Uses `--disable-blink-features=AutomationControlled` to pass Cloudflare Turnstile.
-  - Types nicknames, alternates between `WASD` and `Arrow` keys across bots, varies turn intervals (`0.75x`–`1.30x`), randomly switches between clockwise (`CW`) and counter-clockwise (`CCW`) circles, and adds subtle mouse movements.
-- **Immediate Death Detection & Respawn**:
-  - Continuously monitors `localPlayer` state (`50ms`–`60ms` polling). If a bot crashes into another snake or wall mid-circle, it respawns immediately.
-  - At the end of each round's circle timer, presses `K` (`keyCode = 75`) to self-destruct and respawn for the next round.
-- **No Focus Stealing & Headless Minimize Mode**:
-  - Preserves your active X11 window focus (`xprop` + `wmctrl`) when launching Chrome so it never interrupts your work.
-  - Optional `--minimize` (`-m`) flag runs bots headlessly in the background (`--headless=new`) without creating desktop windows or stealing focus.
-
----
+1. **Coordinator** (`coordinator.py`): splits the bots into `--groups` groups of `--bots-per-proxy` bots, each group on its own proxy IP, and gives every bot one random nickname for the whole run. It places each bot on an agent (the one running the fewest bots per CPU core) and restarts bots whose worker exits, with the same name, on their group's current proxy. All browsers stay open until you stop it. Every `--proxy-check-interval` seconds it re-reads the proxy list (all pages) from Webshare: a group keeps its proxy while it's still listed, and when Webshare rotates it out the group moves to an unused proxy and its bots are told to switch. A proxy that can't reach the game (the browser can't launch through it, or the page stays on "Connecting..." through two reloads) is benched for 30 minutes and its group is moved the same way.
+2. **Agent** (`agent.py`): starts and stops bot workers on its machine when the coordinator says so, passes them proxy changes, and reports workers that exit plus CPU/RAM health. For now the coordinator runs one agent on the same machine; agents on other machines are the next step.
+3. **Workers** (`bot.py`, `bot_worker_process`): each gets an isolated `HOME` (a fresh `/tmp/camoufox_worker_N_*` folder, deleted when the worker exits), waits a staggered start delay, and launches Camoufox through its group's proxy (`--bots-per-proxy` workers share one proxy).
+4. **Session** (`PowerlineBot.run_session`): dismisses consent/reconnect dialogs, handles the Turnstile check, types its nickname the first time it joins, and steers with arrow keys (biased Down/Left, never reversing 180°) while the game's menu overlay is hidden (i.e. actually playing), until the death or lobby screen reappears. It respawns (with Enter) after a random delay that is usually under 2s and occasionally up to 15s; since the game ignores input for about 2s after a death, most respawns land at about 2.5s. When the coordinator reports a new proxy IP, it reloads the game on that IP without closing the browser (in a fresh context, since a context's proxy is fixed). If it stays stuck out of the game for 30s it also reloads the page.
+5. **Input** (`humanizer.py`): every click, mouse move, keypress and pause goes through a `Humanizer` (curved mouse paths, randomized key and click timing, typing with occasional corrected typos). Camoufox's built-in `humanize` is turned off so input isn't humanized twice.
 
 ## Requirements
 
-- **OS**: Linux (X11/XWayland)
-- **System Packages**:
-  - `google-chrome` (or `chromium`)
-  - `wmctrl` and `x11-utils` (`xprop`) for window focus preservation and `--minimize` mode
-- **Python Packages**:
-  ```bash
-  pip install selenium
-  ```
+- Linux with a display, or Windows 10/11 (either one can use `--headless`)
+- Python 3.10+ (tested on 3.10 and 3.14)
+- `pip install -r requirements.txt && python3 -m camoufox fetch`
 
----
+## Usage
 
-## Proxy File Format
-
-Place your Webshare proxy list in the project folder (default filename: `Webshare 10 proxies(4).txt`). Each line must follow the format:
-
-```text
-host:port:username:password
-```
-
-Example:
-```text
-64.137.96.74:6641:myuser:mypassword
-198.23.243.226:6361:myuser:mypassword
-```
-
----
-
-## Quick Start Examples
-
-### 1. List All Available Servers & Room Hashes
 ```bash
-python3 bot.py --list-servers
-```
-Example output:
-```text
-Available Powerline.io Servers:
---------------------------------------------------------------------
-Region             Room Hash    Server IP:Port         Players
---------------------------------------------------------------------
-US East            #72d5        15.204.229.101:8180    6
-Europe             #2cjg        51.91.214.104:8187     11
-US West            #7620        51.81.210.172:8180     0
-Asia               #f06c        15.235.182.97:8180     0
-South America      #fd2d        45.79.193.153:8180     0
---------------------------------------------------------------------
+export WEBSHARE_API_KEY=your_key_here
+python3 coordinator.py                       # 3 groups x 3 bots, room 2cjg
+python3 coordinator.py --groups 4 --bots-per-proxy 2 --headless
 ```
 
-### 2. Run 4 Bots on the Europe Server (Minimized)
+| Option | Default | Description |
+| --- | --- | --- |
+| `--room` | `2cjg` | Room code (the part after `#` in the URL) |
+| `--webshare-key` | `$WEBSHARE_API_KEY` | Webshare API key (required) |
+| `--groups` | `3` | Number of groups, each on its own proxy IP |
+| `--bots-per-proxy` | `3` | Bots in each group |
+| `--stagger-interval` | `3.0` | Seconds between bots in a group connecting |
+| `--proxy-check-interval` | `60` | Seconds between Webshare checks for rotated proxy IPs |
+| `--headless` | off | Run browsers headless |
+| `--debug-dir` | off | Save screenshots of key moments (load, spawn, death, every 30s in game) to this folder |
+
+`python3 bot.py` with the same options still works and does the same thing.
+
+Stop with `Ctrl+C`: the coordinator tells every agent to stop its workers, each worker closes its browser, and anything left in a worker's process group is killed (other Camoufox processes on the machine are not touched). On Windows, Ctrl+Break works the same way. If the coordinator itself crashes or is killed, its workers and their browsers shut down on their own.
+
+## Several machines
+
+The coordinator can spread the bots over several machines on the same network. Each machine runs an agent that connects to the coordinator; new bots go to the machine with the fewest bots per CPU thread, a machine that stays above 85% CPU for 30s hands one bot (same name and proxy) to a machine below 65%, and the bots of a machine that disconnects are restarted elsewhere. Only the coordinator needs the Webshare key.
+
+All machines need the same code (agents with different code are refused) and a shared secret:
+
 ```bash
-python3 bot.py --server "Europe" --minimize
+export POWERLINE_AGENT_KEY=some-long-random-secret   # same value on every machine
+
+# Coordinator (here: also runs at most 1 bot itself)
+python3 coordinator.py --listen 0.0.0.0 --local-max-bots 1 --headless
+
+# Every other machine (Windows: `set POWERLINE_AGENT_KEY=...` and `python agent.py ...`)
+python3 agent.py --coordinator 192.168.1.96 --headless
 ```
 
-### 3. Join a Specific Room by Hash or Full Link
-Allows all bots to join the exact same room where you are playing:
+| Coordinator option | Default | Description |
+| --- | --- | --- |
+| `--listen` | off | Accept agents on `HOST[:PORT]` (default port 4041) |
+| `--wait-agents` | `15` | Seconds to let agents connect before placing bots |
+| `--local-max-bots` | no limit | Most bots this machine runs itself |
+| `--no-local-agent` | off | Run no bots on the coordinator machine |
+
+| Agent option | Default | Description |
+| --- | --- | --- |
+| `--coordinator` | required | Coordinator address `HOST[:PORT]` |
+| `--max-bots` | no limit | Most bots this machine runs |
+| `--headless` | off | Run browsers headless |
+| `--name` | hostname | Name shown in the coordinator's log |
+| `--debug-dir` | off | Save screenshots of key moments |
+
+If the connection drops, an agent stops its bots and reconnects every 5s, so either side can be restarted at any time. Bot names, paused machines, machine bot limits and stopped bots are saved to `~/.config/powerline-bot/state.json` on the coordinator (`--state-file` to change it), so they survive restarts. Coordinator and agents exchange plain JSON messages (never pickle) after both prove they know the shared key. A bot that keeps failing waits longer before each restart (up to 60s), and proxy failures make the coordinator re-read Webshare's list right away, since they usually mean Webshare just rotated its IPs.
+
+## Dashboard
+
+The coordinator can serve a password-protected web page for running everything:
+
+- **Overview**: every bot (state: loading / connecting / lobby / playing / dead, machine, group, IP, rounds, last respawn time), every machine (CPU, RAM, bots), the proxies and a countdown to Webshare's next IP rotation.
+- **Alerts**: a banner when a machine disconnects or is overloaded, bots wait for room or keep failing, every proxy is benched, or Webshare stops answering.
+- **Bots**: stop, start or restart one bot, a selection (checkboxes) or all of them; 📷 shows what a bot's browser currently displays.
+- **Machines**: pause/resume (its bots move elsewhere), bot limit, restart its agent (also loads updated code), stop its bots.
+- **Last hour**: CPU and RAM per machine and bots running/playing, as charts (hover for values).
+- **Live logs** from every machine and bot, filterable by machine, bot and level, plus the coordinator's own events.
+- **Settings**: room code, bots per group, proxy check interval and join stagger; saved and kept after a restart (changing the room or bots per group restarts the bots). Groups can be changed under Proxies.
+
 ```bash
-python3 bot.py --server "2cjg" --minimize
-# or
-python3 bot.py --server "https://powerline.io/#2cjg" --minimize
+export POWERLINE_DASHBOARD_PASSWORD=choose-a-password
+python3 coordinator.py --listen 0.0.0.0 --dashboard 0.0.0.0 --headless   # then open http://<coordinator>:4042
 ```
 
-### 4. Run 6 Bots with Custom Loops, Duration, and Nickname
+Log in with any user name and that password. Keep port 4042 inside your network (don't forward it on the router).
+
+## Start automatically
+
+`deploy/` has everything to start the system when the machines boot. With `--start-stopped` the coordinator, dashboard and agents come up but every bot waits until you press **Start all** (or start single bots) on the dashboard.
+
+**Coordinator machine** (Linux, systemd user service):
+
 ```bash
-python3 bot.py --instances 6 --bots-per-ip 2 --server "Europe" --nick "SnakeBot" --loops 10 --duration 8 --minimize
+mkdir -p ~/.config/powerline-bot ~/.config/systemd/user
+cp deploy/env.example ~/.config/powerline-bot/env && chmod 600 ~/.config/powerline-bot/env
+nano ~/.config/powerline-bot/env          # fill in the keys and password, keep COORDINATOR_ARGS
+cp deploy/powerline-coordinator.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now powerline-coordinator
+loginctl enable-linger                     # run at boot without anyone logged in
+journalctl --user -u powerline-coordinator -f   # follow its log
 ```
 
-### 5. Run with Shorter IP Rotation Interval (e.g., Rotate IP Every 2 Minutes)
+**Other Linux machines**: the same with `deploy/powerline-agent.service` (`systemctl --user enable --now powerline-agent`); their env file only needs `POWERLINE_AGENT_KEY` and `AGENT_ARGS`.
+
+**Windows**: copy `deploy/start-agent.cmd` next to `agent.py`, then in a command prompt:
+
+```bat
+setx POWERLINE_AGENT_KEY "same-secret-as-the-coordinator"
+schtasks /Create /TN "Powerline agent" /SC ONLOGON /RL LIMITED /F /TR "\"%USERPROFILE%\powerline-bot\start-agent.cmd\""
+schtasks /Run /TN "Powerline agent"
+```
+
+It starts when you log in and restarts the agent if it ever exits (log: `agent.log`).
+
+## Tests
+
 ```bash
-python3 bot.py --server "Europe" --ip-rotate-seconds 120 --minimize
+python3 -m unittest discover -s tests
 ```
 
----
+222 tests (about 18s) that need no browser, no Webshare account and no internet: fake pages, browsers, agents and Webshare responses stand in for the real ones (`tests/fakes.py`). They cover:
 
-## Command-Line Options
-
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `--list-servers` | `False` | Fetch and print all live Powerline.io regions, room hashes, and player counts, then exit. |
-| `--server` | `None` (Auto) | Target server region (`"Europe"`, `"eu"`, `"US East"`, `"na"`, `"US West"`, `"Asia"`, `"South America"`, `"sa"`), room hash (`"2cjg"` or `"#2cjg"`), or URL (`"https://powerline.io/#2cjg"`). |
-| `-m`, `--minimize` | `False` | Minimize/hide all bot Chrome windows while keeping the game loop running at 60 FPS. |
-| `--instances` | `4` | Number of concurrent bot instances to run. |
-| `--bots-per-ip` | `2` | Maximum number of bots sharing each proxy IP simultaneously. |
-| `--proxy-file` | `"Webshare 10 proxies(4).txt"` | Path to the proxy list file (`host:port:user:pass`). If missing, connects directly. |
-| `--ip-rotate-seconds` | `300.0` | Seconds before each bot rotates to a new proxy IP (`300` = 5 minutes ± jitter). Set to `0` to disable rotation. |
-| `--nick` | `"CircleBot"` | Base nickname for the bots (`CircleBot1`, `CircleBot2`, ...). |
-| `--loops` | `4` | Number of rounds (spawn -> circle -> press `K` to self-destruct) each bot plays. |
-| `--duration` | `5.0` | Base duration (in seconds) to move in a circle each round before pressing `K`. |
-| `--step` | `0.35` | Base delay (in seconds) between 90-degree turns while circling. |
-| `--keep-open` | `3.0` | Seconds to keep the browser window open after completing all loops before closing. |
-
----
-
-## Troubleshooting
-
-- **Resetting the Static Asset Cache**:
-  If Powerline.io updates its frontend bundle, delete `/tmp/powerline_http_cache_seed` and `/tmp/powerline_flagged_ips.txt` so the bot re-seeds a fresh cache on the next launch:
-  ```bash
-  rm -rf /tmp/powerline_http_cache_seed /tmp/powerline_flagged_ips.txt
-  ```
-- **Cloudflare Turnstile on a Proxy IP**:
-  If a proxy IP has been heavily used and triggers a Turnstile challenge for more than 5 seconds, the bot automatically marks that IP in `/tmp/powerline_flagged_ips.txt` (for 15 minutes) and switches to the next clean proxy IP in your file.
+- **humanizer**: timing distributions, mouse paths (always end on target, no jumps, overshoot rules), click spots inside buttons, typing (typos always corrected), idle drift, fatigue, watchdog
+- **bot**: names, steering odds, status reports and throttling, proxy updates and the stop message, page loading, proxy switching, the respawn loop, exit codes, process-tree clean-up
+- **coordinator**: Webshare paging and errors, rotation countdown, randomized checks of proxy assignment and machine placement, restart backoff, bad-proxy benching, machines leaving, overload moves, snapshot states, state file
+- **agent and network**: message format (JSON only, size limit), every command, the serve loop, reconnects, wrong keys, stalled connections, pickle rejection
+- **dashboard**: login, every bad request, security headers, every button maps to an accepted action, every command

@@ -1,0 +1,3 @@
+camoufox[geoip]
+numpy
+psutil

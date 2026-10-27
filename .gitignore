@@ -3,3 +3,16 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+
+# Local scratch / downloaded site assets
+archive/
+extracted/
+*.zip
+
+# Proxy credential dumps
+Webshare*.txt
+webshare_proxies.txt
+.env
+
+# Run logs
+*.log
