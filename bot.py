@@ -309,9 +309,14 @@ class PowerlineBot:
             return
 
         def _on_ws(ws):
+            url = getattr(ws, "url", "")
             def _on_err(err):
                 err_str = str(err)
                 logger.warning(f"{self.log_prefix} WebSocket error: {err_str}")
+                # The game client first probes ws:// which is rejected with 400 Bad Request
+                # before falling back to wss://. Ignore 400 on unencrypted ws:// probes.
+                if url.startswith("ws://") and ("400" in err_str or "Bad Request" in err_str):
+                    return
                 if any(code in err_str for code in ("400", "403", "407", "Bad Request", "Forbidden")):
                     self.ws_blocked = True
                     self.ws_blocked_reason = f"WebSocket error: {err_str}"
@@ -325,7 +330,10 @@ class PowerlineBot:
                 status = resp.status
                 # Note: 407 is standard proxy authentication challenge; do not abort on it
                 if status in (400, 403):
-                    url = resp.url
+                    url = getattr(resp, "url", "")
+                    # Ignore unencrypted http:// probes to powerline game servers
+                    if url.startswith("http://"):
+                        return
                     # Ignore Cloudflare challenge scripts / asset probes
                     if "challenges.cloudflare" not in url and ("powerline.io" in url or "/_/" in url):
                         logger.warning(f"{self.log_prefix} HTTP {status} response on {url}")
