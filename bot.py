@@ -172,8 +172,8 @@ class EzSolver:
         h = humanizer or Humanizer(page=page)
 
         while time.time() - start_time < timeout:
-            # Playing, lobby or death screen means the game is connected and no challenge is blocking it.
-            if PowerlineBot.is_connected(page):
+            # If already in the active gameplay arena, challenge is passed
+            if not PowerlineBot.is_out_of_game(page):
                 return True
 
             token = page.evaluate("""
@@ -367,7 +367,7 @@ class PowerlineBot:
             pass
 
     def dismiss_overlays_and_consent(self, page, humanizer: Optional[Humanizer] = None):
-        """Decline GDPR consent banners (InMobi "We value your privacy", Google Funding Choices)."""
+        """Decline GDPR consent banners (InMobi "We value your privacy", Google Funding Choices, Quantcast Choice)."""
         h = humanizer or self.humanizer or Humanizer(page=page)
         # Matched by button text so it keeps working if the CMP's markup changes; the banner
         # can be in the page itself or inside a CMP iframe, so check every frame.
@@ -381,6 +381,20 @@ class PowerlineBot:
                     break
             except Exception:
                 pass
+
+        # Remove Quantcast Choice / CMP2 consent banners that intercept pointer events
+        try:
+            page.evaluate("""
+                (() => {
+                    const qc = document.getElementById('qc-cmp2-container');
+                    if (qc) qc.remove();
+                    const qcUi = document.querySelector('.qc-cmp2-ui');
+                    if (qcUi) qcUi.remove();
+                    document.body.classList.remove('qc-cmp2-showing');
+                })()
+            """)
+        except Exception:
+            pass
 
         # Handle room timeout / reconnect button
         try:
@@ -668,7 +682,10 @@ class PowerlineBot:
                         h.type_text(self.nickname, typo_prob=0.04)
                         h.sleep(0.45, 0.08, 0.12, min_floor=0.25)
                     self.debug_shot(page, "spawn")
-                    h.press_key("Enter")
+                    try:
+                        nick_input.first.press("Enter")
+                    except Exception:
+                        h.press_key("Enter")
                     h.sleep(1.0, 0.15, 0.2, min_floor=0.6)
                 else:
                     # In game or still loading: pressing Enter here could start a game without the name.
