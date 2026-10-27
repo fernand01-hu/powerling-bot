@@ -173,7 +173,16 @@ class EzSolver:
 
         while time.time() - start_time < timeout:
             # If already in the active gameplay arena, challenge is passed
-            if not PowerlineBot.is_out_of_game(page):
+            in_arena = page.evaluate("""
+                (() => {
+                    const canvas = document.getElementById('xcanvas');
+                    const nick = document.getElementById('nick');
+                    const death = document.getElementById('deathPlayAgain');
+                    const isVis = (el) => !!el && !el.hidden && el.style.display !== 'none' && el.offsetParent !== null;
+                    return !!canvas && !isVis(nick) && !isVis(death);
+                })()
+            """)
+            if in_arena:
                 return True
 
             token = page.evaluate("""
@@ -386,11 +395,19 @@ class PowerlineBot:
         try:
             page.evaluate("""
                 (() => {
-                    const qc = document.getElementById('qc-cmp2-container');
+                    const qc = document.getElementById('qc-cmp2-container') || document.querySelector('.qc-cmp2-container');
                     if (qc) qc.remove();
                     const qcUi = document.querySelector('.qc-cmp2-ui');
                     if (qcUi) qcUi.remove();
                     document.body.classList.remove('qc-cmp2-showing');
+                    const buttons = Array.from(document.querySelectorAll('button'));
+                    for (const b of buttons) {
+                        const t = b.innerText.trim().toUpperCase();
+                        if (t === 'AGREE' || t === 'ACCEPT ALL' || t === 'I AGREE' || t === 'ACCEPT') {
+                            b.click();
+                            break;
+                        }
+                    }
                 })()
             """)
         except Exception:
@@ -418,24 +435,61 @@ class PowerlineBot:
 
     @staticmethod
     def is_out_of_game(page) -> bool:
-        """True while the game's menu overlay is up (lobby, Connecting..., death screen, kicked, server full).
-        The overlay is hidden only while actually playing."""
-        return page.evaluate("""
+        """True while in the lobby, connecting, dead, or disconnected.
+        False only while actively playing in the arena."""
+        return bool(page.evaluate("""
             (() => {
-                const o = document.getElementById('overlay');
-                return !o || o.offsetParent !== null;
+                const isVis = (el) => {
+                    if (!el) return false;
+                    if (el.hidden) return false;
+                    if (el.style && (el.style.display === 'none' || el.style.visibility === 'hidden')) return false;
+                    try {
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    } catch (e) {}
+                    return el.offsetParent !== null;
+                };
+
+                const canvas = document.getElementById('xcanvas');
+                if (!canvas) return true;
+
+                const death = document.getElementById('deathPlayAgain');
+                if (isVis(death)) return true;
+                const stats = document.getElementById('statsPanel');
+                if (stats && stats.style.display !== 'none' && !stats.hidden) return true;
+
+                const connecting = document.getElementById('topGuiConnecting');
+                if (isVis(connecting)) return true;
+
+                const nick = document.getElementById('nick');
+                if (isVis(nick)) return true;
+
+                const captcha = document.getElementById('captchaFailed');
+                if (isVis(captcha)) return true;
+                const timeout = document.getElementById('roomTimeout');
+                if (isVis(timeout)) return true;
+                const failed = document.getElementById('roomFailed');
+                if (isVis(failed)) return true;
+
+                const overlay = document.getElementById('overlay');
+                return false;
             })()
-        """)
+        """))
 
     @staticmethod
     def is_connected(page) -> bool:
         """True while playing or on the lobby / death screen, i.e. not stuck connecting or blocked."""
-        return page.evaluate("""
+        return bool(page.evaluate("""
             (() => {
-                const vis = (id) => { const e = document.getElementById(id); return !!e && e.offsetParent !== null; };
-                return !vis('overlay') || vis('nick') || vis('deathPlayAgain');
+                const overlay = document.getElementById('overlay');
+                const death = document.getElementById('deathPlayAgain');
+                const isVis = (el) => !!el && !el.hidden && el.style.display !== 'none' && el.offsetParent !== null;
+                if (isVis(death) || isVis(document.getElementById('nick'))) return true;
+                const connecting = document.getElementById('topGuiConnecting');
+                if (isVis(connecting)) return false;
+                return true;
             })()
-        """)
+        """))
 
     def debug_shot(self, page, tag: str):
         """Save a screenshot when --debug-dir is set, to check afterwards what the bot saw."""
@@ -686,6 +740,15 @@ class PowerlineBot:
                         nick_input.first.press("Enter")
                     except Exception:
                         h.press_key("Enter")
+                    try:
+                        page.evaluate("""(name) => {
+                            const win = window.wrappedJSObject || window;
+                            if (typeof win.clickPlay === 'function') {
+                                win.clickPlay(name);
+                            }
+                        }""", self.nickname)
+                    except Exception:
+                        pass
                     h.sleep(1.0, 0.15, 0.2, min_floor=0.6)
                 else:
                     # In game or still loading: pressing Enter here could start a game without the name.
