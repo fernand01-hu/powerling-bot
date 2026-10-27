@@ -497,6 +497,8 @@ class Coordinator:
         for key, low, high in (("proxy_check_interval", 15, 3600), ("stagger_interval", 0, 60)):
             if isinstance(settings.get(key), (int, float)) and low <= settings[key] <= high:
                 setattr(self.args, key, float(settings[key]))
+        if "direct" in settings:
+            self.args.direct = bool(settings["direct"])
         while len(self.nicknames) < self.total:
             self.nicknames.append(generate_random_nickname())
         names = [n for n in state.get("nicknames", []) if isinstance(n, str)]
@@ -520,6 +522,7 @@ class Coordinator:
                 "bots_per_proxy": self.args.bots_per_proxy,
                 "proxy_check_interval": getattr(self.args, "proxy_check_interval", DEFAULT_PROXY_CHECK_INTERVAL),
                 "stagger_interval": self.args.stagger_interval,
+                "direct": getattr(self.args, "direct", False),
             },
         }
         try:
@@ -734,6 +737,8 @@ class Coordinator:
 
     def usable_proxies(self) -> List[Dict[str, str]]:
         """Webshare's list minus proxies benched as bad; all of them if every one is benched."""
+        if getattr(self.args, "direct", False) or not getattr(self.args, "webshare_key", None):
+            return []
         now = time.time()
         usable = [p for p in self.proxy_mgr.proxies if self.bad_until.get(proxy_key(p), 0) <= now]
         return usable or self.proxy_mgr.proxies
@@ -751,12 +756,14 @@ class Coordinator:
         self.group_proxies = new
 
     def check_proxies(self):
+        if getattr(self.args, "direct", False) or not getattr(self.args, "webshare_key", None):
+            return
         self.last_fetch = time.time()
         if self.proxy_mgr.fetch_proxies():
             self.apply_proxies()
 
     def _is_real_ip(self, host: str) -> bool:
-        if not host:
+        if not host or host == "direct":
             return False
         parts = host.split(".")
         return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
@@ -854,7 +861,7 @@ class Coordinator:
 
     def auto_replace_proxy_async(self, bad_ip: str):
         """Queue a bad proxy IP for batched, rate-limited Webshare API v3 rotation."""
-        if not self.auto_replace or not getattr(self.args, "webshare_key", None):
+        if getattr(self.args, "direct", False) or not self.auto_replace or not getattr(self.args, "webshare_key", None):
             return
         if not self._is_real_ip(bad_ip):
             return
@@ -884,20 +891,21 @@ class Coordinator:
                     bad = event.get("proxy") or current
                     moved = proxy_key(bad) != proxy_key(current)
                     bad_desc = f"{bad['host']}:{bad['port']}" if bad else "direct"
-                    logger.warning(
-                        f"[Coordinator] Bot #{bot_id} reports proxy {bad_desc} can't reach the game; "
-                        f"benching it for {BAD_PROXY_COOLDOWN // 60} min"
-                        + (" (its group has already moved)." if moved else " and moving its group.")
-                    )
-                    if bad:
-                        self.bad_until[proxy_key(bad)] = time.time() + BAD_PROXY_COOLDOWN
-                        if self.auto_replace and bad.get("host"):
-                            self.auto_replace_proxy_async(bad["host"])
-                    if time.time() - self.last_fetch >= MIN_REFETCH_INTERVAL:
-                        # Failing proxies usually mean Webshare just rotated: pick up the new list now.
-                        self.check_proxies()
+                    if getattr(self.args, "direct", False) or not bad:
+                        logger.warning(f"[Coordinator] Bot #{bot_id} exited on direct connection. Restarting...")
                     else:
-                        self.apply_proxies()
+                        logger.warning(
+                            f"[Coordinator] Bot #{bot_id} reports proxy {bad_desc} can't reach the game; "
+                            f"benching it for {BAD_PROXY_COOLDOWN // 60} min"
+                            + (" (its group has already moved)." if moved else " and moving its group.")
+                        )
+                        self.bad_until[proxy_key(bad)] = time.time() + BAD_PROXY_COOLDOWN
+                        if self.auto_replace and bad.get("host") and self._is_real_ip(bad["host"]):
+                            self.auto_replace_proxy_async(bad["host"])
+                        if time.time() - self.last_fetch >= MIN_REFETCH_INTERVAL:
+                            self.check_proxies()
+                        else:
+                            self.apply_proxies()
                 else:
                     logger.warning(
                         f"[Coordinator] Bot #{bot_id} exited unexpectedly on {agent.name} (code {event['code']}). Restarting..."
