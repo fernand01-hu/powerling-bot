@@ -51,8 +51,30 @@ DEFAULT_PROXY_CHECK_INTERVAL = 60.0  # Seconds between Webshare checks for rotat
 BAD_PROXY_COOLDOWN = 30 * 60         # Seconds a bad proxy is left out of the rotation
 
 GAME_WS_HOST = "51-91-214-104.powerline.io"
-GAME_WS_PORT = 9187
+GAME_WS_PORT = 9180
 GAME_WS_PATH = "/_/db1fa2b8"
+
+
+def resolve_game_server(room: str = "") -> Tuple[str, int]:
+    """Query master.powerline.io for the exact edge host and secure WebSocket port for a room."""
+    target_host = GAME_WS_HOST
+    target_port = GAME_WS_PORT
+    if not room:
+        return target_host, target_port
+    try:
+        import json
+        req = urllib.request.Request("https://master.powerline.io/servers", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        for r in data.get("regions", []):
+            if r.get("hash") == room and "server" in r:
+                ip, port_str = r["server"].split(":")
+                target_host = ip.replace(".", "-") + ".powerline.io"
+                target_port = int(port_str) + 1000
+                break
+    except Exception as e:
+        logger.debug(f"[Coordinator] Master server resolution failed ({e}); using default {target_host}:{target_port}")
+    return target_host, target_port
 
 
 def probe_proxy_handshake(
@@ -237,10 +259,9 @@ class WebshareManager:
             except ValueError:
                 pass
         if valid:
-            # Prioritize European low-latency proxies closest to 51.91.214.104 (OVH France)
-            # Deprioritize/bench slow or throttled proxies (e.g. UA)
-            pref = {"FR": 1, "DE": 2, "ES": 3, "IT": 4, "IE": 5, "RO": 6, "GR": 7, "US": 8, "MX": 9, "BR": 10, "UA": 99}
-            valid.sort(key=lambda p: pref.get(p.get("country", "").upper(), 50))
+            # Deprioritize slow or throttled proxies (e.g. UA)
+            pref = {"UA": 99}
+            valid.sort(key=lambda p: pref.get(p.get("country", "").upper(), 0))
             self.proxies = valid
             logger.info(f"[Webshare] Fetched {len(valid)} active proxies from API.")
         return self.proxies
@@ -781,9 +802,10 @@ class Coordinator:
             return []
         import concurrent.futures
         bad = []
+        target_host, target_port = resolve_game_server(getattr(getattr(self, "args", None), "room", ""))
 
         def _check(p):
-            ok, reason = probe_proxy_handshake(p)
+            ok, reason = probe_proxy_handshake(p, target_host=target_host, target_port=target_port)
             return p, ok, reason
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(to_probe)))) as ex:
@@ -794,6 +816,10 @@ class Coordinator:
                 bad.append(p)
                 self.bad_until[proxy_key(p)] = time.time() + BAD_PROXY_COOLDOWN
                 logger.warning(f"[Coordinator] Proxy {p['host']}:{p['port']} flagged by game server: {reason}")
+            else:
+                self.bad_until.pop(proxy_key(p), None)
+        now = time.time()
+        self.proxy_mgr.proxies.sort(key=lambda p: 0 if self.bad_until.get(proxy_key(p), 0) <= now else 1)
         return bad
 
     def clean_flagged_proxies(self, max_rounds: int = 5) -> int:
@@ -1276,6 +1302,8 @@ class Coordinator:
                 logger.warning(
                     f"[Coordinator] Only {len(self.proxy_mgr.proxies)} proxies for {self.groups} groups; some groups share an IP."
                 )
+            logger.info("[Coordinator] Probing proxies against game server edge...")
+            self.probe_proxies()
             if getattr(self.args, "clean_proxies", False):
                 self.clean_flagged_proxies()
             self.group_proxies = reassign_proxies([None] * self.groups, self.usable_proxies())

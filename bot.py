@@ -335,7 +335,7 @@ class PowerlineBot:
                 # before falling back to wss://. Ignore 400 on unencrypted ws:// probes.
                 if url.startswith("ws://") and ("400" in err_str or "Bad Request" in err_str):
                     return
-                if any(code in err_str for code in ("400", "403", "407", "Bad Request", "Forbidden")):
+                if any(code in err_str for code in ("400", "403", "407", "Bad Request", "Forbidden", "CLOSE_ABNORMAL")):
                     self.ws_blocked = True
                     self.ws_blocked_reason = f"WebSocket error: {err_str} on {url}"
             try:
