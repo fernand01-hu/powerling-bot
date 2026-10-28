@@ -550,6 +550,10 @@ class PowerlineBot:
             self.dismiss_overlays_and_consent(page, humanizer=self.humanizer)
             EzSolver.solve(page, log_prefix=self.log_prefix, timeout=2.0, humanizer=self.humanizer)
             try:
+                page.evaluate("() => { try { (window.wrappedJSObject || window).displayNickInput?.(); } catch(e){} }")
+            except Exception:
+                pass
+            try:
                 page.wait_for_selector("#nick", state="visible", timeout=1000)
                 break
             except Exception:
@@ -735,6 +739,11 @@ class PowerlineBot:
 
                 # 2. Check for Turnstile
                 EzSolver.solve(page, log_prefix=self.log_prefix, timeout=5.0, humanizer=h)
+
+                try:
+                    page.evaluate("() => { try { (window.wrappedJSObject || window).displayNickInput?.(); } catch(e){} }")
+                except Exception:
+                    pass
 
                 # 3. Check current page state (In lobby, Dead, In game)
                 death_btn = page.locator("#deathPlayAgain")

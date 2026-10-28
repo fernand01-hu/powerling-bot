@@ -497,7 +497,8 @@ class Coordinator:
         for key, low, high in (("proxy_check_interval", 15, 3600), ("stagger_interval", 0, 60)):
             if isinstance(settings.get(key), (int, float)) and low <= settings[key] <= high:
                 setattr(self.args, key, float(settings[key]))
-        if "direct" in settings:
+        # Only allow state.json to override direct mode if no webshare key is configured
+        if not getattr(self.args, "webshare_key", None) and "direct" in settings:
             self.args.direct = bool(settings["direct"])
         while len(self.nicknames) < self.total:
             self.nicknames.append(generate_random_nickname())
