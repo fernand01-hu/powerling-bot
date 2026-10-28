@@ -879,6 +879,15 @@ class PowerlineBot:
                         try:
                             page.locator("#deathPlayAgain:visible, #nick:visible").first.wait_for(timeout=3000)
                         except Exception:
+                            logger.info(
+                                f"{self.log_prefix} Match disconnected; fast-reloading page for fresh session token..."
+                            )
+                            try:
+                                page.reload(wait_until="domcontentloaded", timeout=15000)
+                                h.reset_watchdog()
+                                h.sleep(1.5, 0.2, 0.3, min_floor=0.8)
+                            except Exception:
+                                pass
                             break  # Not a normal death (kicked, disconnected...); the outer loop handles it
                         if not page.locator("#deathPlayAgain").first.is_visible():
                             break  # Back at the lobby; the outer loop spawns from there
