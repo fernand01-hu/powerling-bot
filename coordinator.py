@@ -237,6 +237,10 @@ class WebshareManager:
             except ValueError:
                 pass
         if valid:
+            # Prioritize European low-latency proxies closest to 51.91.214.104 (OVH France)
+            # Deprioritize/bench slow or throttled proxies (e.g. UA)
+            pref = {"FR": 1, "DE": 2, "ES": 3, "IT": 4, "IE": 5, "RO": 6, "GR": 7, "US": 8, "MX": 9, "BR": 10, "UA": 99}
+            valid.sort(key=lambda p: pref.get(p.get("country", "").upper(), 50))
             self.proxies = valid
             logger.info(f"[Webshare] Fetched {len(valid)} active proxies from API.")
         return self.proxies

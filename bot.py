@@ -595,6 +595,13 @@ class PowerlineBot:
         # It ignores input while the death animation plays (~1.5-2s), so retry until it respawns.
         give_up = time.time() + 6
         while True:
+            try:
+                page.evaluate("""() => {
+                    const btn = document.getElementById('deathPlayAgain');
+                    if (btn) btn.click();
+                }""")
+            except Exception:
+                pass
             self.humanizer.press_key("Enter")
             self.humanizer.sleep(0.35, 0.05, 0.08, min_floor=0.25)
             if not self.is_out_of_game(page):
@@ -741,7 +748,14 @@ class PowerlineBot:
                 EzSolver.solve(page, log_prefix=self.log_prefix, timeout=5.0, humanizer=h)
 
                 try:
-                    page.evaluate("() => { try { (window.wrappedJSObject || window).displayNickInput?.(); } catch(e){} }")
+                    page.evaluate("""() => {
+                        const death = document.getElementById('deathPlayAgain');
+                        const connecting = document.getElementById('topGuiConnecting');
+                        const isVis = (el) => !!el && !el.hidden && el.style.display !== 'none' && el.offsetParent !== null;
+                        if (!isVis(death) && isVis(connecting)) {
+                            (window.wrappedJSObject || window).displayNickInput?.();
+                        }
+                    }""")
                 except Exception:
                     pass
 
@@ -804,16 +818,14 @@ class PowerlineBot:
                             f"{self.log_prefix} Stuck state watchdog triggered (trapped out-of-game). Attempting page reload..."
                         )
                         self.debug_shot(page, "stuck")
-                        # A proxy that already got this bot into the game is only having a slow
-                        # moment (or the machine is overloaded); only one that never connected is bad.
-                        if not seen_game and not self.reached_game:
+                        if not seen_game:
                             failed_reloads += 1
                             if failed_reloads >= MAX_FAILED_RELOADS:
                                 if self.poll_proxy_update():
                                     continue  # The coordinator already moved this bot; switch instead
                                 logger.warning(
                                     f"{self.log_prefix} Proxy {self.proxy['host'] if self.proxy else 'direct'} "
-                                    f"never got past connecting; reporting it as bad."
+                                    f"trapped out of game ({failed_reloads} consecutive reloads); reporting it as bad."
                                 )
                                 return BAD_PROXY_EXIT
                         seen_game = False
@@ -913,8 +925,7 @@ class PowerlineBot:
             logger.info(f"{self.log_prefix} Terminated, closing browser.")
         except Exception as e:
             logger.error(f"{self.log_prefix} Session error: {e}", exc_info=True)
-            if not self.reached_game:
-                # Failed before ever reaching the game (e.g. the proxy refuses connections at launch).
+            if self.ws_blocked or not self.reached_game or any(k in str(e).upper() for k in ("TIMEOUT", "PROXY", "TARGET CLOSED")):
                 return BAD_PROXY_EXIT
         return None
 
