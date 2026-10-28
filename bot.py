@@ -550,10 +550,6 @@ class PowerlineBot:
             self.dismiss_overlays_and_consent(page, humanizer=self.humanizer)
             EzSolver.solve(page, log_prefix=self.log_prefix, timeout=2.0, humanizer=self.humanizer)
             try:
-                page.evaluate("() => { try { (window.wrappedJSObject || window).displayNickInput?.(); } catch(e){} }")
-            except Exception:
-                pass
-            try:
                 page.wait_for_selector("#nick", state="visible", timeout=1000)
                 break
             except Exception:
@@ -754,7 +750,7 @@ class PowerlineBot:
 
                 death_visible = death_btn.count() > 0 and death_btn.first.is_visible()
                 nick_visible = not death_visible and nick_input.count() > 0 and nick_input.first.is_visible()
-                if death_visible or nick_visible:
+                if death_visible:
                     self.reached_game = seen_game = True
                     failed_reloads = 0
 

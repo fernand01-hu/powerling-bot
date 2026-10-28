@@ -522,8 +522,8 @@ class Coordinator:
         for key, low, high in (("proxy_check_interval", 15, 3600), ("stagger_interval", 0, 60)):
             if isinstance(settings.get(key), (int, float)) and low <= settings[key] <= high:
                 setattr(self.args, key, float(settings[key]))
-        # Only allow state.json to override direct mode if no webshare key is configured
-        if not getattr(self.args, "webshare_key", None) and "direct" in settings:
+        # Allow state.json / dashboard settings to configure direct mode
+        if "direct" in settings:
             self.args.direct = bool(settings["direct"])
         while len(self.nicknames) < self.total:
             self.nicknames.append(generate_random_nickname())
@@ -1304,9 +1304,8 @@ class Coordinator:
                 logger.warning(
                     f"[Coordinator] Only {len(self.proxy_mgr.proxies)} proxies for {self.groups} groups; some groups share an IP."
                 )
-            logger.info("[Coordinator] Probing proxies against game server edge...")
-            self.probe_proxies()
             if getattr(self.args, "clean_proxies", False):
+                logger.info("[Coordinator] Probing proxies against game server edge (--clean-proxies)...")
                 self.clean_flagged_proxies()
             self.group_proxies = reassign_proxies([None] * self.groups, self.usable_proxies())
             self.proxy_mgr.fetch_refresh_frequency()
