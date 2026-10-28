@@ -938,13 +938,15 @@ class Coordinator:
                             self.check_proxies()
                         else:
                             self.apply_proxies()
+                    self.failures[bot_id] = 0
+                    delay = random.uniform(1.0, 3.0)
                 else:
                     logger.warning(
                         f"[Coordinator] Bot #{bot_id} exited unexpectedly on {agent.name} (code {event['code']}). Restarting..."
                     )
-                delay = restart_delay(self.failures[bot_id])
-                if self.failures[bot_id] > 1:
-                    logger.info(f"[Coordinator] Bot #{bot_id} failed {self.failures[bot_id]} times in a row; restarting in {delay:.0f}s.")
+                    delay = restart_delay(self.failures[bot_id])
+                    if self.failures[bot_id] > 1:
+                        logger.info(f"[Coordinator] Bot #{bot_id} failed {self.failures[bot_id]} times in a row; restarting in {delay:.0f}s.")
                 self.place_bot(bot_id, delay)
 
     # --- Dashboard ----------------------------------------------------------
