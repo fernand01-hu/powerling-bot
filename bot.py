@@ -598,7 +598,8 @@ class PowerlineBot:
             try:
                 page.evaluate("""() => {
                     const btn = document.getElementById('deathPlayAgain');
-                    if (btn) btn.click();
+                    const isVis = (el) => !!el && !el.hidden && el.style.display !== 'none' && el.offsetParent !== null;
+                    if (isVis(btn)) btn.click();
                 }""")
             except Exception:
                 pass
@@ -747,18 +748,6 @@ class PowerlineBot:
                 # 2. Check for Turnstile
                 EzSolver.solve(page, log_prefix=self.log_prefix, timeout=5.0, humanizer=h)
 
-                try:
-                    page.evaluate("""() => {
-                        const death = document.getElementById('deathPlayAgain');
-                        const connecting = document.getElementById('topGuiConnecting');
-                        const isVis = (el) => !!el && !el.hidden && el.style.display !== 'none' && el.offsetParent !== null;
-                        if (!isVis(death) && isVis(connecting)) {
-                            (window.wrappedJSObject || window).displayNickInput?.();
-                        }
-                    }""")
-                except Exception:
-                    pass
-
                 # 3. Check current page state (In lobby, Dead, In game)
                 death_btn = page.locator("#deathPlayAgain")
                 nick_input = page.locator("#nick")
@@ -796,14 +785,23 @@ class PowerlineBot:
                         h.press_key("Enter")
                     try:
                         page.evaluate("""(name) => {
-                            const win = window.wrappedJSObject || window;
-                            if (typeof win.clickPlay === 'function') {
-                                win.clickPlay(name);
+                            const nick = document.getElementById('nick');
+                            const isVis = (el) => !!el && !el.hidden && el.style.display !== 'none' && el.offsetParent !== null;
+                            if (isVis(nick)) {
+                                const win = window.wrappedJSObject || window;
+                                if (typeof win.clickPlay === 'function') {
+                                    win.clickPlay(name);
+                                }
                             }
                         }""", self.nickname)
                     except Exception:
                         pass
-                    h.sleep(1.0, 0.15, 0.2, min_floor=0.6)
+                    # Wait up to 3 seconds for the spawn transition into arena
+                    spawn_start = time.time()
+                    while time.time() - spawn_start < 3.0:
+                        if not self.is_out_of_game(page):
+                            break
+                        h.sleep(0.2, 0.03, 0.05, min_floor=0.1)
                 else:
                     # In game or still loading: pressing Enter here could start a game without the name.
                     h.sleep(0.3, 0.05, 0.08, min_floor=0.15)
